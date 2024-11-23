@@ -1,10 +1,14 @@
-<!-- start custom head snippets, customize with your own _includes/custom-head.html file -->
+{% comment %}
+  Placeholder to allow defining custom head, in principle, you can add anything here, e.g. favicons:
 
-<!-- You can set your favicon here -->
-<link rel="shortcut icon" type="image/x-icon" href="{{ '/assets/img/favicons/favicon.ico' | relative_url }}">
-<link rel="apple-touch-icon" sizes="180x180" href=" {{ '/assets/img/favicons/apple-touch-icon.png | relative_url }}">
-<link rel="icon" type="image/png" sizes="32x32" href=" {{ '/assets/img/favicons/favicon-32x32.png | relative_url }}">
-<link rel="icon" type="image/png" sizes="16x16" href=" {{ '/assets/img/favicons/favicon-16x16.png | relative_url }}">
-<link rel="manifest" href=" {{ '/assets/img/favicons/site.webmanifest | relative_url }}">
+  1. Head over to https://realfavicongenerator.net/ to add your own favicons.
+  2. Customize default _includes/custom-head.html in your source directory and insert the given code snippet.
+{% endcomment %}
+
+<link rel="icon" type="image/png" href="{{'/favicons/favicon-96x96.png' | relative_url }}" sizes="96x96" />
+<link rel="icon" type="image/svg+xml" href="{{'/favicons/favicon.svg' | relative_url }}" />
+<link rel="shortcut icon" href="{{'/favicons/favicon.ico' | relative_url }}" />
+<link rel="apple-touch-icon" sizes="180x180" href="{{'/favicons/apple-touch-icon.png' | relative_url }}" />
+<link rel="manifest" href="{{'/favicons/site.webmanifest' | relative_url }}" />
 
 <!-- end custom head snippets -->

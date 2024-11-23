@@ -28,7 +28,7 @@ twitter_username: 你猜
 github_username:  xiaoyuzhzh
 
 # Build settings
-theme: minima
+theme: Architect
 plugins:
   - jekyll-feed
 

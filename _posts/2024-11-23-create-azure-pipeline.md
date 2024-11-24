@@ -63,8 +63,47 @@ pipeline的步骤可以分成三个部分：
 完成这一整个链路了。这里还涉及到如何使用pass保存镜像仓库的密钥，避免密钥泄漏。还要通过GPG来加密密钥。后续再补充。
 
 #### 开始配置pipeline
+##### yaml语法
 pipeline的配置完全是通过yaml文件来完成的。所以需要线学习一个pipeline的yaml语法（这里假设你已经懂yaml本身的格式了）。
 跟jenkins的pipeline类似，azure的pipeline也是树形的结构。大致可以分为三层。
 1. stages: stage是pipeline的最大执行单元，可以用与分割多个阶段的继承代码
 2. jobs: job是stage的最小执行单元，可以包含多个tasks。一个stage可以有多个job。
 3. task: task是job下的分支，一个job可以包含多个tasks，比较特殊的是，job下的task是通过steps来关联的。
+
+##### service connection
+在pipeline中，需要使用service connection来连接你的服务器。包括ssh连接服务器，
+还有登陆阿里云镜像仓库来push镜像。
+###### 创建一个镜像仓库的service connection
+。。。
+
+#### stage1 打包镜像并发布到阿里云容器仓库
+```yaml
+variables:
+  tag: '$(Build.BuildId)'
+
+stages:
+- stage: Build_and_push
+  displayName: Build and push image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: Docker@2
+      displayName: build and push
+      inputs:
+        containerRegistry: 'aliyun-registry'
+        repository: 'xxx/azure-test'
+        command: 'buildAndPush'
+        Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+```
+这是一个任务单元，使用的是azure pipeline预设的任务
+* command决定了这个预设任务做什么，
+这是约定好的值不能改，这个command就是构建docker镜像并发布到镜像仓库。
+* containerRegistry
+就是我们配置好的仓库的service connection名称。
+* repository就是我们push的镜像 **命名空间/仓库名**
+* Dockerfile就是我们项目里已经编写好的dockerfile文件。
+
+这个任务就可以实现打包我们的项目镜像并发布到配置中心了

@@ -58,7 +58,13 @@ pipeline的步骤可以分成三个部分：
 ##### 服务器配置
 有了阿里云镜像之后，就是要配置服务器的环境了。
 1. 安装一个docker的容器环境。
-2. 测试docker能否登陆阿里云的容器仓库
+2. 测试docker能否登陆阿里云的容器仓库。
 3. 尝试在本地项目打包镜像并上传到阿里云容器仓库，并在服务器下载镜像并部署。确实可以之后。就可以去pipeline
-完成这一整个链路了。
+完成这一整个链路了。这里还涉及到如何使用pass保存镜像仓库的密钥，避免密钥泄漏。还要通过GPG来加密密钥。后续再补充。
 
+#### 开始配置pipeline
+pipeline的配置完全是通过yaml文件来完成的。所以需要线学习一个pipeline的yaml语法（这里假设你已经懂yaml本身的格式了）。
+跟jenkins的pipeline类似，azure的pipeline也是树形的结构。大致可以分为三层。
+1. stages: stage是pipeline的最大执行单元，可以用与分割多个阶段的继承代码
+2. jobs: job是stage的最小执行单元，可以包含多个tasks。一个stage可以有多个job。
+3. task: task是job下的分支，一个job可以包含多个tasks，比较特殊的是，job下的task是通过steps来关联的。

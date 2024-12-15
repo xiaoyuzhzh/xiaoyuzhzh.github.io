@@ -73,7 +73,7 @@ pipeline的配置完全是通过yaml文件来完成的。所以需要线学习�
 ##### service connection
 在pipeline中，需要使用service connection来连接你的服务器。包括ssh连接服务器，
 还有登陆阿里云镜像仓库来push镜像。
-###### 创建一个镜像仓库的service connection
+创建一个镜像仓库的service connection
 。。。
 
 #### stage1 打包镜像并发布到阿里云容器仓库
@@ -107,3 +107,51 @@ stages:
 * Dockerfile就是我们项目里已经编写好的dockerfile文件。
 
 这个任务就可以实现打包我们的项目镜像并发布到配置中心了
+
+#### stage2 部署到服务器
+**创建 ssh 链接托管（service connection）**   
+将服务务器部署到服务器上，需要用到ssh连接服务器。这里继续使用 azure 的 service connection 来创建
+ssh 链接的托管。
+**服务器准备好脚本**  
+在服务器上需要准备好需要的脚本，方便直接部署。 现在继续写 pipeline 的 stage2。
+```yaml
+- stage: Deploy
+  displayName: Deploy to Remote Server
+  jobs:
+  - job: DeployJob
+    displayName: Deploy Image
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: SSH@0
+      displayName: Pull and Run Docker Image
+      inputs:
+        sshEndpoint: 'cheap-ecs'
+        runOptions: 'inline'
+        inline:  |
+          cd ~
+          export GPG_PASSWORD=$(gpgPassword)
+          source ~/.profile
+          echo $(dockerPassword) | docker login --username $(dockerUsername) --password-stdin $(dockerRegistryUrlVPC)
+          echo "enter gpg password"
+          # ./pass.sh
+          echo $GPG_PASSWORD | gpg --batch --yes --passphrase-fd 0 --decrypt-files ~/.password-store/docker-credentials.gpg 2>&1
+          echo "start pull image and run"
+          bash ./deploy.sh '$(Build.BuildId)'
+```
+这里就直接看任务单元，
+[task:SSH@0](https://learn.microsoft.com/en-us/azure/devops/pipelines/tasks/reference/ssh-v0?view=azure-pipelines&viewFallbackFrom=azure-devops) 这也是预设的 pipeline 命令
+使用这个任务就可以借助配置好的 ssh 托管登录上远程服务器并执行命令。
+* sshEndpoint 就是我创建的 ecs ssh 托管  
+* runOptions: 'inline' 是命令行的运行选项。总共可以设置三个，具体看 devops 文档。  
+* inline：这就是 inline 模式下，把服务器脚本直接写在 pipeline 中。
+  * 从命令中可以看到我写的比较复杂，实际还用了环境变量，这块没有整理好，主要是为了保证
+  密码安全。
+
+按照上面的步骤，基本就完成了一个自己的可以运维的脚本配置了。
+
+
+
+
+
+

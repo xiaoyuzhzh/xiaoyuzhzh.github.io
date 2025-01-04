@@ -1,0 +1,1 @@
+新建项目后，在setting > repository 里，设置默认分支和分支保护

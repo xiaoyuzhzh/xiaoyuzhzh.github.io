@@ -1,18 +1,13 @@
 ---
-
+title: 使用 Azure DevOps 创建自动化部署流水线
+date: 2024-11-23
+summary: 本文记录了如何从零开始使用 Azure DevOps 创建一个完整的 CI/CD 流水线，实现代码自动构建、打包镜像、推送到阿里云镜像仓库，并部署到远程服务器。适用于个人项目或小型团队实践 DevOps 自动化部署。
 ---
-### 为什么要用azure-pipeline
-#### 为什么要用
-因为自己有一些想搭建的服务，但是自己打包部署服务感觉挺麻烦的，
-最简单也需要在服务端写个脚本自动下载应用并打包部署。但是过程也不好监控。
 
-#### 为什么选azure-pipeline
-选azure-pipeline指示因为公司最近考虑使用azure devops来做CICD，所以就用了。
-实际上，每个云平台都有一定的免费CICD额度供个人用户使用。
+### 为什么使用 Azure Pipeline
+Azure Pipeline 是 Azure DevOps 提供的持续集成与持续部署（CI/CD）工具。使用它可以简化服务的打包与部署过程，免去手动操作服务器的麻烦，提升可维护性与可监控性。本文选择 Azure Pipeline 是因为公司正在评估 Azure DevOps 作为企业级 CI/CD 方案，同时 Azure DevOps 为个人用户提供了免费额度，非常适合入门与实验。
 
-
-
-### azure devops注册账号
+### 注册 Azure DevOps 账号
 [azure devops 官网](https://azure.microsoft.com/en-us/products/devops)
 
 先在官网注册账号。注册账号之后，就需要创建组织了。
@@ -24,7 +19,7 @@
 <img src="{{ '/assets/post/create-azure-pipeline/create-project.png' | relative_url }}" width="70%">
 
 
-### 创建pipeline
+### 创建 Pipeline
 在azure devops里，可以直接不管敏捷开发那一套，直接来使用pipeline功能。
 <img src="{{ '/assets/post/create-azure-pipeline/create-pipeline.png' | relative_url }}" width="50%">
 1. 代码位置选择自己所用的代码仓库。
@@ -33,7 +28,7 @@
 
 到目前为止，你的yaml文件就创建好了。
 
-### 配置pipeline
+### 配置 Pipeline
 刚开始创建的pipeline是根据项目语言自动识别的。到这里就需要更加的深入理解pipeline是什么了。
 首先，pipeline是一个流水线，也就是你的代码会经过一系列的步骤，然后才能部署到你的服务器。
 pipeline的步骤可以分成三个部分：
@@ -63,7 +58,9 @@ pipeline的步骤可以分成三个部分：
 3. 尝试在本地项目打包镜像并上传到阿里云容器仓库，并在服务器下载镜像并部署。确实可以之后。就可以去pipeline
 完成这一整个链路了。这里还涉及到如何使用pass保存镜像仓库的密钥，避免密钥泄漏。还要通过GPG来加密密钥。后续再补充。
 
-#### 开始配置pipeline
+到目前为止，我们完成了基础的 YAML 文件配置。接下来我们将详细拆解每个阶段的配置细节。
+
+### 配置 Pipeline 各阶段任务
 **yaml语法**
 pipeline的配置完全是通过yaml文件来完成的。所以需要线学习一个pipeline的yaml语法（这里假设你已经懂yaml本身的格式了）。
 跟jenkins的pipeline类似，azure的pipeline也是树形的结构。大致可以分为三层。
@@ -76,7 +73,7 @@ pipeline的配置完全是通过yaml文件来完成的。所以需要线学习�
 创建一个镜像仓库的service connection。可以在项目设置里找到服务链接，创建一个 docker registry即可。
 
 
-#### stage1 打包镜像并发布到阿里云容器仓库
+#### 阶段 1：打包镜像并发布到阿里云容器仓库
 ```yaml
 variables:
   tag: '$(Build.BuildId)'
@@ -108,7 +105,7 @@ stages:
 
 这个任务就可以实现打包我们的项目镜像并发布到配置中心了
 
-#### stage2 部署到服务器
+#### 阶段 2：部署到远程服务器
 **创建 ssh 链接托管（service connection）**   
 将服务务器部署到服务器上，需要用到ssh连接服务器。这里继续使用 azure 的 service connection 来创建
 ssh 链接的托管。
@@ -150,8 +147,6 @@ ssh 链接的托管。
 
 按照上面的步骤，基本就完成了一个自己的可以运维的脚本配置了。
 
+### 总结
 
-
-
-
-
+本文介绍了如何使用 Azure DevOps 构建一个完整的 CI/CD 流水线，涵盖项目打包、镜像构建、推送至镜像仓库，以及远程服务器部署的全过程。通过结合 Docker 与 Azure Pipeline 的服务连接配置，能够实现端到端的自动化部署。后续还可继续拓展如构建缓存、蓝绿部署、安全审计等功能，进一步提升部署效率与安全性。

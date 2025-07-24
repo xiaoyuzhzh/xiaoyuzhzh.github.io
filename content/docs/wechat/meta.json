@@ -1,0 +1,5 @@
+{
+  "title": "微信小程序开发",
+  "pages": ["wechat-build","..."],
+  "defaultOpen": false
+}

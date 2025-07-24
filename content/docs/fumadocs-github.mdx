@@ -1,0 +1,212 @@
+---
+title: 部署 fuma-docs 到 github pages
+description: 部署 fuma-docs 到 github pages
+---
+
+---
+
+**本方案简介**
+
+本流程以 Fumadocs 为文档系统，通过其静态导出功能，将所有文档页面一次性生成为纯静态资源，并统一输出到本地目录（如 `out` 或 `docs`）。
+随后通过 git 管理，将静态产物推送到 GitHub Pages 指定目录或分支，实现文档站点的免费上线、自动托管、支持自定义域名。
+此过程适合个人、团队快速搭建高可用、低维护的静态文档站。
+
+本方案不仅支持保存完整源码到 GitHub，实现团队协作和版本管理，还可以通过自动化脚本一键打包静态文件、提交到远程仓库，快速完成 GitHub Pages 的部署和上线。
+
+---
+
+## 部署 Fumadocs 到 GitHub Pages 完整流程
+
+### 1. 配置文档项目
+
+**官方参考文档：** [https://fumadocs.dev/docs/ui](https://fumadocs.dev/docs/ui)
+
+```bash
+npm create fumadocs-app@latest
+```
+> ⚠️ **Node.js 版本要求：必须大于 18 且小于 23.1（建议用 Node 20 LTS）。**
+
+
+
+### 2. 配置静态导出目录（推荐 docs/）
+
+**官方参考文档：**  [https://fumadocs.dev/docs/ui/static-export](https://fumadocs.dev/docs/ui/static-export)
+
+- Fumadocs/Next.js 默认静态导出目录为 out/
+- 因为 github pages 的静态页面只能放在根目录或者 docs 目录，所以，这里推荐直接把 out/ 移动到 docs。后面会有统一的脚本
+- 示例脚本（Linux/macOS）：
+ ```bash
+ npm run build
+ ```
+### 3. 给静态页面实现搜索功能。
+**官方参考文档：**
+[https://fumadocs.dev/docs/ui/search/orama#static](https://fumadocs.dev/docs/ui/search/orama#static)
+[https://fumadocs.dev/docs/headless/search/orama#static-export](https://fumadocs.dev/docs/headless/search/orama#static-export)
+
+* 修改下面的文件，把搜索变成静态的，这样就可以实现把文档静态加载到页面上，实现前端搜索
+```ts  title="app/api/search/route.ts"
+import { source } from '@/lib/source';
+import { createFromSource } from 'fumadocs-core/search/server';
+// it should be cached forever
+export const revalidate = false;
+export const { staticGET: GET } = createFromSource(source);//[!code highlight]
+```
+
+* 新增一个组件，包装搜索 client
+```tsx title="components/search.tsx"
+'use client';
+import {
+  SearchDialog,
+  SearchDialogClose,
+  SearchDialogContent,
+  SearchDialogHeader,
+  SearchDialogIcon,
+  SearchDialogInput,
+  SearchDialogList,
+  SearchDialogOverlay,
+  type SharedProps,
+} from 'fumadocs-ui/components/dialog/search';
+import { useDocsSearch } from 'fumadocs-core/search/client';
+import { create } from '@orama/orama';
+import { useI18n } from 'fumadocs-ui/contexts/i18n';
+
+function initOrama() {
+  return create({
+    schema: { _: 'string' },
+    // https://docs.orama.com/open-source/supported-languages
+    language: 'english',
+  });
+}
+
+export default function DefaultSearchDialog(props: SharedProps) {
+  const { locale } = useI18n(); // (optional) for i18n
+  const { search, setSearch, query } = useDocsSearch({
+    type: 'static',
+    initOrama,
+    locale,
+  });
+
+  return (
+    <SearchDialog
+      search={search}
+      onSearchChange={setSearch}
+      isLoading={query.isLoading}
+      {...props}
+    >
+      <SearchDialogOverlay />
+      <SearchDialogContent>
+        <SearchDialogHeader>
+          <SearchDialogIcon />
+          <SearchDialogInput />
+          <SearchDialogClose />
+        </SearchDialogHeader>
+        <SearchDialogList items={query.data !== 'empty' ? query.data : null} />
+      </SearchDialogContent>
+    </SearchDialog>
+  );
+}
+```
+* 替换默认的搜索框
+```tsx tab="app/provider.tsx"
+'use client';
+import { RootProvider } from 'fumadocs-ui/provider';
+// your custom dialog
+import SearchDialog from '@/components/search';//[!code highlight]
+import type { ReactNode } from 'react';
+
+export function Provider({ children }: { children: ReactNode }) {
+  return (
+    <RootProvider
+      search={{
+        SearchDialog,
+      }}
+    >
+      {children}
+    </RootProvider>
+  );
+}
+```
+
+```tsx tab="app/layout.tsx"
+import { Provider } from './provider';
+import type { ReactNode } from 'react';
+
+export default function Layout({ children }: { children: ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        <!--[!code highlight]-->
+        <Provider>{children}</Provider>
+      </body>
+    </html>
+  );
+}
+```
+
+配置完成之后，可以重新执行 ```bas npm run build ``` 获得的静态页面就支持搜索了。
+
+
+### 5. 测试静态页面
+
+在本地使用静态文件服务器测试打包后的页面效果，确保所有路由、资源和功能正常。推荐用 npx serve（无需安装，全平台适用）：
+
+```bash
+npx serve docs
+```
+
+默认会在 [http://localhost:3000](http://localhost:3000) 启动本地服务。
+
+**注意：不要直接用 file:// 方式打开 HTML，否则会出现路径、资源加载等各种问题。推荐始终用本地 HTTP 服务预览测试。**
+
+
+
+### 6. 生成 .nojekyll 和 CNAME 文件
+
+- 必须在 docs/ 目录内生成 `.nojekyll` 避免 GitHub Pages 拦截下划线目录（如 _next）。
+ ```bash
+ touch docs/.nojekyll
+ ```
+- 若用自定义域名，需生成 CNAME 文件：
+ ```bash
+ echo "your.domain.com" > docs/CNAME
+ ```
+
+### 7. 配置 GitHub Pages
+   - 准备好 github page的仓库
+   - 仓库 Settings → Pages，分支选择 main 下 docs 目录。
+   - 用自定义域名要正确配置 custom domain。
+
+### 8. git 管理与推送
+
+   - docs/ 目录不能被 .gitignore 忽略。
+   - 提交并推送所有文件到远程仓库。这里不展开 git 库关联了
+
+### 9. 访问站点，确认页面与资源可用
+
+## 关键坑点与解决方案
+
+- `.nojekyll` 文件必须存在，否则 github 会当做 jekyll 项目解析，路径会失效
+- CNAME 文件每次重建/覆盖都需要自动生成，否则自定义域名会失效。
+- Next.js 只能导出到 out/，需手动移动到 docs/。
+- docs/ 目录不能被 .gitignore 忽略。
+
+## 推荐一键自动化部署脚本 deploy.sh
+
+```bash
+#!/bin/bash
+set -e
+
+npm run build
+rm -rf docs
+mv out docs
+touch docs/.nojekyll
+# 注意域名替换成自己的域名，如果自己没有域名，不适用 cname，则可以删除这一行
+echo "your.domain.com" > docs/CNAME #[!code highlight]
+
+git add -A
+DATE=$(date "+%Y-%m-%d %H:%M:%S")
+git commit -m "auto: build and deploy ($DATE)" || echo "No changes to commit"
+git push origin main
+```
+
+---

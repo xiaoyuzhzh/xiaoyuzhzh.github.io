@@ -4,6 +4,8 @@ set -e
 
 npm run build
 
+echo "blog.xiaoyuzhzh.com" > docs/CNAME
+
 git add -A
 
 # 获取当前日期时间，格式为 2024-07-24 14:35:01

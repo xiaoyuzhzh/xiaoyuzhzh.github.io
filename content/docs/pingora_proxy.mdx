@@ -1,0 +1,218 @@
+---
+title: pingora 做反向代理
+description:  pingora 做反向代理
+---
+
+## pingora 是什么
+pingora 是 cloudflare 公司开源的一个代理框架，本意是为了弥补一些 nginx 的不足。
+我研究 pingora 的原因纯粹是想学习一下 rust，要说 pingora 能不能很好的替代 nginx，
+还得看大家的需求。
+
+## 快速上手 pingora
+[pingora源码官方地址](https://github.com/cloudflare/pingora)
+[pingora快速上手文档](https://github.com/cloudflare/pingora/blob/main/docs/quick_start.md)
+
+从 pingora 的快速文档可以看出来 pingora 其实只是开源了一个可变成的 http 服务框架，
+有兴趣的朋友可以按照教程跑一下。我自己因为跑不通他们的 1.1.1.1 的服务器，所以没成功。
+但是他是自带了一个代理服务器需要的组件。所有的代码我还没有研究过，本文仅解释一下被用来
+实现反向代理的组件
+
+### 开搞代码
+
+#### 热豆腐
+心急的朋友可以直接看下面是我搞得一个项目 demo
+[项目源码位置](https://github.com/xiaoyuzhzh/gateway)
+可以根据 README 里的说明来实现一个反向代理
+
+#### 现在开始介绍一下搭建过程
+要实现反向代理，首先需要添加 pingora 的依赖，修改 cargo.toml
+添加
+```toml
+pingora = { version = "0.4.0", features = [ "lb" ] }
+```
+pingora 的两个组件用来实现反向代理
+
+**Server**
+Server是在 server mod 下。主要用来启动一个 http 服务。关键代码如下
+```rust
+    let mut my_server = Server::new(None).unwrap();
+    my_server.bootstrap();
+
+    let proxy = MyProxy::new();
+
+    let mut lb = http_proxy_service(&my_server.configuration,proxy);
+    lb.add_tcp("0.0.0.0:6188");
+
+    my_server.add_service(lb);
+
+    my_server.run_forever();
+```
+
+**ProxyHttp**
+ProxyHttp是在 proxy_trait mod下
+ProxyHttp封装了关键的代理需要的方法，要实现反向代理，我们需要创建一个 struct，并实现 ProxyHttp trait
+在 MyProxy 中实现一个方法 upstream_peer，例子如下
+```rust
+pub struct MyProxy {
+
+/*
+ * 实现 http 代理的核心方法
+ */
+#[async_trait]
+impl ProxyHttp for MyProxy {
+    type CTX = ();
+
+    fn new_ctx(&self) -> Self::CTX {
+        ()
+    }
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<Box<HttpPeer>> {
+
+            //找到一个 upstreem 返回。
+            let peer = HttpPeer::new(upstream, false, String::new());
+            return Ok(Box::new(peer));
+        }
+
+        Err(pingora::Error::new(ErrorType::new("not found")))
+    }
+
+}
+}
+```
+这里的逻辑就是在 upstream_peer 里返回一个反向代理解析出来的可访问的上游地址
+> 在系统的调用层面，被调用方一般被叫做上游。
+
+所有，反向代理的逻辑在这里实现就行了。
+首先，我们需要做一个反向代理的规则配置逻辑。我这里基于 yaml 配置反向代理。
+yaml 格式如下
+```yaml
+routes:
+  "/path/to/9081":
+    forward_to: "localhost:9081"
+    replace_path: ""
+  "/path/to/7001":
+    forward_to: "localhost:7001"
+    replace_path: ""
+
+```
+这个格式的代理就会实现uri 前缀是 /path/to/9081 的请求，转发到 localhost:9081，
+接下来就开始做配置识别的逻辑。
+依赖添加
+```toml
+config = "0.14.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+```
+```rust
+#[derive(Debug, Deserialize)]
+struct RouteConfig {
+    forward_to: String,
+    replace_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Settings {
+    routes: HashMap<String,RouteConfig>,
+}
+
+
+fn load_configs()-> Result<Settings,ConfigError>{
+
+    let mut builder = Config::builder();
+    let config_path = if let Ok(config_path) = env::var("CONFIG_PATH"){
+        config_path
+    }else {
+        "/app/config/config.yaml".to_string()
+    };
+
+    builder = builder.add_source(config::File::new(&config_path,FileFormat::Yaml));
+    let setting = builder.build()?.try_deserialize::<Settings>()?;
+
+    println!("config: {:?}", setting);
+    Ok(setting)
+}
+```
+load_configs 函数就是用来加载配置文件的，配置文件的路径默认是 /app/config/config.yaml，
+但是可以通过环境变量 CONFIG_PATH 来指定配置文件的路径。
+
+有了配置的识别逻辑，我们就可以创建一个函数来返回所有的代理规则
+```rust
+fn get_lbs() -> HashMap<String, Arc<LoadBalancer<RoundRobin>>> {
+
+    let settings = load_configs().unwrap_or_else(|e| {
+        eprintln!("Failed to load config: {:?}", e);
+        panic!("load config failed");
+    });
+
+    // 设置不同路由的后端地址
+    let mut lbs = HashMap::new();
+    for (route, config) in settings.routes {
+        lbs.insert(
+            route,
+            Arc::new(
+                LoadBalancer::<RoundRobin>::try_from_iter(vec![config.forward_to]).unwrap(),
+            ),
+        );
+    }
+    lbs
+}
+```
+这个方法用来从配置里解析出所有的反向代理地址，并返回一个 map，key 是路由，
+value 是LoadBalancer。这个是用来做代理关键的组件。
+```rust
+pub struct MyProxy {
+    lbs: HashMap<String, Arc<LoadBalancer<RoundRobin>>>,
+    settings: Settings,
+}
+```
+定义MyProxy，并实现 ProxyHttp trait。MyProxy的属性有两个，一个是 lbs，
+是一个代理路径到上游服务器的映射。现在开始实现 upstream_peer 方法。
+```rust
+async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> pingora::Result<Box<HttpPeer>> {
+        let original_uri = session.req_header().uri.clone();
+        let original_path = original_uri.path();
+
+        println!("routes: {:?}", self.settings.routes);
+
+        // 检查是否有任何路由键是当前请求路径的前缀
+        if let Some((route, route_config)) = self.settings.routes.iter().find(|(key, _)| original_path.starts_with(&**key)) {
+            println!("Value of str: '{}'", route);
+            let new_path = original_path.replacen(route, &route_config.replace_path, 1); // 替换匹配的部分路径
+            // 获取原始的 query string
+            let original_query = original_uri.query().unwrap_or("");
+            // 构建新的 path 和 query string
+            let path_and_query = format!("{}?{}", new_path, original_query);
+            let new_uri = Uri::builder()
+                .scheme(original_uri.scheme().unwrap_or(&http::uri::Scheme::HTTP).as_str())
+                .authority(route_config.forward_to.clone())
+                .path_and_query(path_and_query)
+                .build()
+                .unwrap();
+
+            session.req_header_mut().set_uri(new_uri);
+
+            let lb = Arc::new(LoadBalancer::try_from_iter("localhost:8080"));
+            let endPoint = Arc::clone(&lb).select(b"",256).unwrap();
+            let lb = self.lbs.get(route).unwrap();
+            let upstream = lb.select(b"", 256).unwrap();
+            let peer = HttpPeer::new(upstream, false, String::new());
+            return Ok(Box::new(peer));
+        }
+
+        Err(pingora::Error::new(ErrorType::new("not found")))
+    }
+```
+方法里就是获取请求的路径，然后检查是否有任何路由键是当前请求路径的前缀。如果有就
+替换匹配的部分路径，构建新的 path 和 query string，然后构建新的 Uri，并设置到
+session 的请求头里。
+至此我们就完成了反向代理的逻辑。实际这个匹配其实还是有优化空间的，后续我再优化。
+完整代码参看前面给的代码样板地址。
+

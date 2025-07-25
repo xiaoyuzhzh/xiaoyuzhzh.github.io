@@ -14,14 +14,14 @@ export default function Layout({children}: { children: ReactNode }) {
             <link rel="icon" href="/favicon.svg"/>
             <title>凌波小碎步</title>
             {/* Google Analytics */}
-            <script async src="https://www.googletagmanager.com/gtag/js?id=G-LFJ08Y9BGJ"></script>
+            <script async src="https://www.googletagmanager.com/gtag/js?id=G-LF308Y9BGJ"></script>
             <script
                 dangerouslySetInnerHTML={{
                     __html: `
             window.dataLayer = window.dataLayer || [];
             function gtag(){dataLayer.push(arguments);}
             gtag('js', new Date());
-            gtag('config', 'G-LFJ08Y9BGJ');
+            gtag('config', 'G-LF308Y9BGJ');
           `,
                 }}
             />

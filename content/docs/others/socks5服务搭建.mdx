@@ -1,0 +1,104 @@
+---
+title: socks5 搭建
+description:  为了方便给住宅 ip 做前置节点，找一个 vps 搭建一个 socks5 服务
+---
+
+# Socks5 节点搭建方案笔记
+
+## 1. 需求分析
+
+- 目标：在 VPS 上搭建一个稳定的 Socks5 代理服务，用于转发流量到住宅 IP。
+- 要求：
+  - 支持认证，防止未授权访问。
+  - 连接稳定，支持多用户。
+  - 配置简单，易于管理。
+
+## 2. 环境准备
+
+- VPS：建议使用 Linux 服务器，如 Ubuntu 20.04。
+- 安装必要的软件包：`curl`, `wget`, `vim` 等。
+
+## 3. 搭建步骤
+
+### 3.1 安装 Dante Socks5 服务器
+
+Dante 是一个流行的开源 Socks5 服务器。
+
+```bash
+sudo apt update
+sudo apt install dante-server -y
+```
+
+### 3.2 配置 Dante
+
+编辑配置文件 `/etc/danted.conf`：
+
+```conf
+logoutput: syslog
+
+internal: 0.0.0.0 port = 1080
+external: eth0
+
+method: username none
+user.privileged: proxy
+user.notprivileged: nobody
+user.libwrap: nobody
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+
+pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    log: connect disconnect error
+}
+```
+
+- `internal` 指定监听地址和端口。
+- `external` 指定外网接口名称，使用 `ip addr` 查看。
+- `method` 指定认证方式，这里示例为用户名认证。
+
+### 3.3 添加用户认证
+
+创建一个代理用户：
+
+```bash
+sudo adduser proxyuser
+sudo passwd proxyuser
+```
+
+将 `method` 修改为：
+
+```conf
+method: username
+```
+
+### 3.4 启动并测试服务
+
+```bash
+sudo systemctl restart danted
+sudo systemctl enable danted
+```
+
+使用支持 Socks5 的客户端，输入 VPS IP、端口（1080）和认证用户信息测试连接。
+
+## 4. 其他 Socks5 服务搭建方案
+
+| 方案          | 优点                        | 缺点                         |
+| ------------- | --------------------------- | ---------------------------- |
+| Dante         | 稳定，支持认证，功能丰富    | 配置相对复杂                 |
+| Shadowsocks   | 简单，支持加密              | 主要设计为代理，不完全是 Socks5 |
+| 3proxy        | 轻量级，配置简单            | 功能较 Dante 简单            |
+| SSH 隧道      | 简单安全，无需额外软件      | 需要 SSH 连接，性能有限       |
+
+## 5. 参考资料
+
+- [Dante 官方文档](https://www.inet.no/dante/)
+- [Shadowsocks GitHub](https://github.com/shadowsocks/shadowsocks)
+- [3proxy 官方网站](https://3proxy.ru/)
+
+---
+
+以上就是搭建 Socks5 节点的基本方案和步骤，选用合适的方案根据实际需求调整配置即可。

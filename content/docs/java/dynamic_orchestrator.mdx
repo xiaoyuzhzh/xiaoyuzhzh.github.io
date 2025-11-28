@@ -1,0 +1,1504 @@
+---
+title: 通用业务组件编排框架方案
+description: 接住 project reactor 异步编排能力和同步转异步的能力实现的动态并发编排框架
+full: false
+---
+
+---
+
+## 一、框架概述
+
+本方案基于 project reactor 实现编排框架。该框架提供动态编排能力，业务方可在接口层灵活组装组件执行顺序。
+
+### 核心优势
+
+- **自动依赖解析**：通过注解声明组件依赖关系，框架自动进行拓扑排序
+- **智能并发调度**：基于依赖关系自动识别可并发执行的组件，最大化性能
+- **灵活的业务编排**：业务方在接口层直接编排组件，无需配置策略
+- **响应式编程**：使用 Reactor 实现非阻塞并发，支持背压和错误传播
+- **可观测性强**：完整的执行日志、依赖关系可视化、性能监控
+
+### 设计理念
+
+框架分为两个核心部分：
+
+1. **动态编排组件套装**（框架核心）：提供组件接口、依赖注解、并发编排器，支持动态组件编排
+2. **业务层灵活编排**（业务使用）：业务方在接口层直接调用编排器，自主组装组件列表
+
+---
+
+## 二、核心一：动态编排组件套装
+
+### 2.1 核心接口：业务组件接口
+
+```java
+/**
+ * 业务组件接口
+ * 所有业务组件都需要实现此接口
+ *
+ * @param <C> 上下文类型
+ */
+public interface BusinessComponent<C> {
+
+    /**
+     * 执行业务逻辑
+     *
+     * @param context 业务上下文
+     * @return 执行结果，Left为失败，Right为成功
+     */
+    Either<String, C> execute(C context);
+
+    /**
+     * 获取组件名称
+     * 默认使用类名（去掉Component后缀）
+     */
+    default String getComponentName() {
+        String className = this.getClass().getSimpleName();
+        return className.endsWith("Component")
+            ? className.substring(0, className.length() - "Component".length())
+            : className;
+    }
+
+    /**
+     * 获取组件描述
+     * 用于日志输出
+     */
+    default String getDescription() {
+        return getComponentName() + "处理";
+    }
+}
+```
+
+### 2.2 核心注解：依赖声明
+
+```java
+/**
+ * 组件依赖注解
+ * 用于声明业务组件的前置依赖关系
+ */
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DependsOn {
+
+    /**
+     * 依赖的组件类型
+     */
+    Class<? extends BusinessComponent<?>>[] value();
+
+    /**
+     * 依赖未满足时的错误消息
+     */
+    String message() default "前置依赖条件未满足";
+}
+```
+
+### 2.3 核心类：并发编排器
+
+```java
+/**
+ * Reactor 并发编排器
+ * 使用 Reactor 实现基于依赖关系的自动并发调度
+ *
+ * @param <C> 上下文类型
+ */
+@Slf4j
+@Service
+public class ReactorOrchestrator<C> {
+
+    private final Map<Class<?>, BusinessComponent<C>> componentMap;
+    private final Map<Class<?>, List<Class<?>>> dependencyGraph;
+    private final Scheduler scheduler;
+
+    // 全量组件的拓扑排序结果（启动时计算一次，全局复用）
+    private final List<Class<?>> globalSortedComponents;
+
+    public ReactorOrchestrator(
+            List<BusinessComponent<C>> components,
+            Executor executor) {
+        this.scheduler = Schedulers.fromExecutor(executor);
+        this.componentMap = buildComponentMap(components);
+        this.dependencyGraph = buildDependencyGraph(components);
+
+        // 启动时对全量组件进行拓扑排序（只计算一次）
+        this.globalSortedComponents = topologySort(new ArrayList<>(componentMap.keySet()));
+
+        log.info("编排器初始化完成，全量组件拓扑排序: {} 个组件", globalSortedComponents.size());
+    }
+
+    /**
+     * 执行组件链（优化版本）
+     * 基于全量拓扑排序结果快速筛选，无需重新排序
+     *
+     * @param context 业务上下文
+     * @param componentClasses 需要执行的组件类列表
+     * @return 执行结果
+     */
+    public Mono<Either<String, C>> executeComponents(
+            C context,
+            List<Class<? extends BusinessComponent<C>>> componentClasses) {
+
+        Set<Class<?>> classSet = new HashSet<>(componentClasses);
+
+        // 从全量拓扑排序中筛选出当前需要的组件（保持拓扑顺序）
+        // 时间复杂度：O(N)，N为全量组件数，远快于拓扑排序的 O(V+E)
+        List<Class<?>> sortedClasses = globalSortedComponents.stream()
+            .filter(classSet::contains)
+            .collect(Collectors.toList());
+
+        // 找出终端节点（没有被其他组件依赖的组件）
+        Set<Class<?>> terminalNodes = findTerminalNodes(classSet);
+
+        // 为每个组件构建 Mono 链
+        Map<Class<?>, Mono<Either<String, C>>> monoMap =
+            buildMonoChain(context, classSet, sortedClasses);
+
+        // 执行所有终端节点（Reactor 会自动触发依赖链）
+        return Flux.fromIterable(terminalNodes)
+            .flatMap(monoMap::get)
+            .reduce((result1, result2) -> {
+                // 短路逻辑：任一失败则返回失败
+                if (result1.isLeft()) {
+                    return result1;
+                }
+                return result2;
+            })
+            .defaultIfEmpty(Either.right(context));
+    }
+
+    // 其他辅助方法：buildMonoChain, buildMonoForComponent,
+    // findTerminalNodes, topologySort 等
+    // （实现细节参考 ReactorGridCheckOrchestrator.java）
+}
+```
+
+### 2.4 性能优化
+
+框架内置**全量拓扑排序复用**优化：启动时对所有组件进行一次拓扑排序，运行时从全量排序结果中快速筛选出需要的组件。
+
+- **性能提升**：10-100倍（相比每次拓扑排序）
+- **零开销**：无需缓存机制和缓存键管理
+- **透明优化**：业务方无需关心，框架自动处理
+
+详见：[编排框架性能优化方案](编排框架性能优化方案.md)
+
+---
+
+## 三、核心二：业务层灵活编排
+
+业务方无需配置策略，直接在接口/服务层调用编排器，动态指定要执行的组件列表。
+
+### 3.1 基本编排方式
+
+所有场景统一使用一个 API，框架内部自动优化（基于全量拓扑排序复用）。
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private ReactorOrchestrator<OrderContext> orchestrator;
+
+    /**
+     * 普通订单处理
+     */
+    public Either<String, Order> processNormalOrder(OrderRequest request) {
+        OrderContext context = buildContext(request);
+
+        // 直接在接口中指定组件列表
+        List<Class<? extends BusinessComponent<OrderContext>>> components = Arrays.asList(
+            ParameterValidationComponent.class,
+            InventoryCheckComponent.class,
+            CreditCheckComponent.class,
+            PriceCalculationComponent.class,
+            OrderCreationComponent.class
+        );
+
+        // 统一API，框架自动从全量拓扑排序中快速筛选
+        return orchestrator.executeComponents(context, components)
+            .block()
+            .flatMap(ctx -> Either.right(ctx.getOrder()));
+    }
+
+    /**
+     * VIP订单处理（不同的组件编排）
+     */
+    public Either<String, Order> processVipOrder(OrderRequest request) {
+        OrderContext context = buildContext(request);
+
+        // VIP订单使用不同的组件列表
+        List<Class<? extends BusinessComponent<OrderContext>>> components = Arrays.asList(
+            ParameterValidationComponent.class,
+            VipCreditCheckComponent.class,        // VIP专用信用检查
+            InventoryCheckComponent.class,
+            VipDiscountComponent.class,           // VIP折扣
+            GiftPackageComponent.class,           // 赠品包
+            PriceCalculationComponent.class,
+            OrderCreationComponent.class
+        );
+
+        // 同样的API，无需缓存键
+        return orchestrator.executeComponents(context, components)
+            .block()
+            .flatMap(ctx -> Either.right(ctx.getOrder()));
+    }
+}
+```
+
+### 3.2 条件编排方式
+
+根据业务条件动态构建组件列表：
+
+```java
+@Service
+public class FlexibleOrderService {
+
+    @Autowired
+    private ReactorOrchestrator<OrderContext> orchestrator;
+
+    public Either<String, Order> processOrder(OrderRequest request) {
+        OrderContext context = buildContext(request);
+
+        // 动态构建组件列表
+        List<Class<? extends BusinessComponent<OrderContext>>> components = new ArrayList<>();
+
+        // 基础组件（必选）
+        components.add(ParameterValidationComponent.class);
+
+        // 根据订单类型添加组件
+        if (request.isEnterpriseOrder()) {
+            components.add(EnterpriseContractCheckComponent.class);
+            components.add(TaxInvoiceComponent.class);
+        }
+
+        // 根据业务模式添加组件
+        if (request.requiresCreditCheck()) {
+            components.add(CreditCheckComponent.class);
+        }
+
+        // 通用组件
+        components.add(InventoryCheckComponent.class);
+        components.add(PriceCalculationComponent.class);
+
+        // 根据渠道添加组件
+        if ("APP".equals(request.getChannel())) {
+            components.add(AppPromotionComponent.class);
+        } else if ("PC".equals(request.getChannel())) {
+            components.add(WebCouponComponent.class);
+        }
+
+        components.add(OrderCreationComponent.class);
+
+        return orchestrator.executeComponents(context, components)
+            .block()
+            .flatMap(ctx -> Either.right(ctx.getOrder()));
+    }
+}
+```
+
+### 3.3 组件套装复用
+
+提取常用组件组合，方便复用：
+
+```java
+@Component
+public class OrderComponentSets {
+
+    /**
+     * 基础校验组件套装
+     */
+    public List<Class<? extends BusinessComponent<OrderContext>>> basicValidation() {
+        return Arrays.asList(
+            ParameterValidationComponent.class,
+            InventoryCheckComponent.class,
+            CreditCheckComponent.class
+        );
+    }
+
+    /**
+     * 企业订单专用组件套装
+     */
+    public List<Class<? extends BusinessComponent<OrderContext>>> enterpriseChecks() {
+        return Arrays.asList(
+            EnterpriseContractCheckComponent.class,
+            TaxInvoiceComponent.class,
+            BudgetApprovalComponent.class
+        );
+    }
+
+    /**
+     * 营销组件套装
+     */
+    public List<Class<? extends BusinessComponent<OrderContext>>> marketingComponents() {
+        return Arrays.asList(
+            CouponComponent.class,
+            PromotionComponent.class,
+            PointsComponent.class
+        );
+    }
+
+    /**
+     * 组合多个套装
+     */
+    public List<Class<? extends BusinessComponent<OrderContext>>> compose(
+            List<List<Class<? extends BusinessComponent<OrderContext>>>> sets) {
+        return sets.stream()
+            .flatMap(List::stream)
+            .collect(Collectors.toList());
+    }
+}
+
+@Service
+public class OrderService {
+
+    @Autowired
+    private ReactorOrchestrator<OrderContext> orchestrator;
+
+    @Autowired
+    private OrderComponentSets componentSets;
+
+    public Either<String, Order> processEnterpriseOrder(OrderRequest request) {
+        OrderContext context = buildContext(request);
+
+        // 组合多个套装
+        List<Class<? extends BusinessComponent<OrderContext>>> components = componentSets.compose(
+            Arrays.asList(
+                componentSets.basicValidation(),      // 基础校验
+                componentSets.enterpriseChecks(),     // 企业专用
+                componentSets.marketingComponents(),  // 营销活动
+                Arrays.asList(OrderCreationComponent.class)  // 订单创建
+            )
+        );
+
+        return orchestrator.executeComponents(context, components)
+            .block()
+            .flatMap(ctx -> Either.right(ctx.getOrder()));
+    }
+}
+```
+
+---
+
+## 四、框架工作原理
+
+### 3.1 依赖关系解析
+
+框架在启动时通过 `@DependsOn` 注解构建依赖图（有向无环图 DAG）：
+
+```
+示例依赖关系：
+ParameterValidation (无依赖)
+    ├── MarginCheck (依赖 ParameterValidation)
+    │     └── CreditLineCheck (依赖 MarginCheck)
+    └── PolicyCheck (依赖 ParameterValidation)
+```
+
+### 3.2 拓扑排序
+
+使用 Kahn 算法对组件进行拓扑排序，确保依赖的组件先执行：
+
+1. 统计每个节点的入度（被依赖的次数）
+2. 将入度为0的节点（无依赖）加入队列
+3. 不断取出入度为0的节点，并减少其邻居的入度
+4. 重复直到队列为空
+5. 如果处理的节点数少于总数，说明存在循环依赖
+
+详细算法参考：`GridCheckOrchestrator.java:121-236`
+
+### 3.3 并发调度策略
+
+框架基于依赖关系智能调度：
+
+**无依赖组件**：立即并发执行
+
+```java
+// 组件 A, B, C 无依赖，同时提交到线程池并发执行
+Mono.defer(() -> Mono.fromCallable(() -> component.execute(context))
+    .subscribeOn(scheduler))
+    .cache();
+```
+
+**有依赖组件**：等待依赖完成后执行
+
+```java
+// 组件 D 依赖 A, B，等待 A、B 都完成后再执行
+Flux.merge(monoA, monoB)
+    .collectList()
+    .flatMap(depResults -> {
+        // 检查依赖是否成功
+        if (有失败) return Mono.just(失败结果);
+        // 执行当前组件
+        return Mono.fromCallable(() -> componentD.execute(context))
+            .subscribeOn(scheduler);
+    })
+    .cache();
+```
+
+### 4.4 执行流程图
+
+```
+┌─────────────────────────────────────────┐
+│ 1. 业务层组装组件列表                    │
+│    根据业务逻辑动态构建组件列表          │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│ 2. 构建依赖图                            │
+│    解析 @DependsOn 注解                  │
+│    构建 DAG 并检测循环依赖               │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│ 3. 构建 Reactor Mono 链                  │
+│    为每个组件创建 Mono                   │
+│    无依赖组件 → 立即提交线程池           │
+│    有依赖组件 → flatMap 依赖 Mono        │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│ 4. 触发执行                              │
+│    找到终端节点（无被依赖的组件）        │
+│    触发终端节点 Mono                     │
+│    Reactor 自动触发依赖链                │
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│ 5. 结果聚合                              │
+│    reduce 合并所有终端节点结果           │
+│    短路逻辑：任一失败立即返回            │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 五、使用示例
+
+### 5.1 定义业务组件
+
+```java
+/**
+ * 示例：参数校验组件
+ */
+@Component
+public class ParameterValidationComponent implements BusinessComponent<OrderContext> {
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        if (context.getOrderId() == null) {
+            return Either.left("订单ID不能为空");
+        }
+        return Either.right(context);
+    }
+
+    @Override
+    public String getComponentName() {
+        return "参数校验";
+    }
+}
+
+/**
+ * 示例：库存检查组件（依赖参数校验）
+ */
+@Component
+@DependsOn(ParameterValidationComponent.class)
+public class InventoryCheckComponent implements BusinessComponent<OrderContext> {
+
+    @Resource
+    private InventoryService inventoryService;
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        boolean available = inventoryService.checkStock(context.getProductId());
+        if (!available) {
+            return Either.left("库存不足");
+        }
+        return Either.right(context);
+    }
+
+    @Override
+    public String getComponentName() {
+        return "库存检查";
+    }
+}
+
+/**
+ * 示例：信用额度检查组件（依赖参数校验）
+ */
+@Component
+@DependsOn(ParameterValidationComponent.class)
+public class CreditCheckComponent implements BusinessComponent<OrderContext> {
+
+    @Resource
+    private CreditService creditService;
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        BigDecimal creditLimit = creditService.getCreditLimit(context.getUserId());
+        if (creditLimit.compareTo(context.getOrderAmount()) < 0) {
+            return Either.left("信用额度不足");
+        }
+        // 将信用额度写入上下文，供后续组件使用
+        context.setCreditLimit(creditLimit);
+        return Either.right(context);
+    }
+}
+```
+
+---
+
+## 六、框架特性详解
+
+### 6.1 自动并发优化
+
+框架会自动识别可并发的组件：
+
+```
+依赖关系：
+A (无依赖)
+B (无依赖)
+C (依赖 A)
+D (依赖 A, B)
+
+执行计划：
+时间 0ms：A 和 B 同时开始（并发度=2）
+时间 50ms：A 完成，C 开始
+时间 80ms：B 完成，D 开始（A 已完成）
+时间 130ms：C 完成
+时间 150ms：D 完成
+
+总耗时：150ms（串行需要 260ms）
+```
+
+### 6.2 上下文共享与隔离
+
+**共享机制**：所有组件共享同一个上下文对象
+
+```java
+// 组件 A 写入数据
+context.setPowerStationConfig(config);
+
+// 组件 B（依赖 A）读取数据
+Map<String, String> config = context.getPowerStationConfig();
+```
+
+**并发安全性**：
+- 并发执行的组件应该写入不同字段，避免竞态条件
+- 有依赖关系的组件顺序执行，能安全读取依赖组件写入的数据
+
+### 6.3 短路机制
+
+任一组件失败，后续依赖它的组件不会执行：
+
+```java
+// 组件 A 失败
+return Either.left("参数校验失败");
+
+// 依赖 A 的组件 B、C、D 都不会执行
+// 直接返回 A 的错误信息
+```
+
+### 6.4 循环依赖检测
+
+框架在构建阶段会检测循环依赖：
+
+```java
+@DependsOn(ComponentB.class)
+class ComponentA { }
+
+@DependsOn(ComponentC.class)
+class ComponentB { }
+
+@DependsOn(ComponentA.class)
+class ComponentC { }
+
+// 启动时抛出异常：
+// IllegalStateException: 检测到组件依赖环路: [ComponentA, ComponentB, ComponentC]
+```
+
+---
+
+## 七、性能优化建议
+
+### 7.1 线程池配置
+
+```java
+@Configuration
+public class OrchestratorConfig {
+
+    @Bean("businessExecutor")
+    public Executor businessExecutor() {
+        return new ThreadPoolExecutor(
+            10,  // 核心线程数
+            50,  // 最大线程数
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000),
+            new ThreadFactoryBuilder().setNameFormat("biz-orchestrator-%d").build(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+    }
+}
+```
+
+### 7.2 Mono 缓存
+
+框架使用 `.cache()` 避免组件被多次执行：
+
+```java
+// 组件 A 被 B、C、D 依赖
+// 使用 cache() 确保 A 只执行一次，结果被 B、C、D 共享
+Mono.fromCallable(() -> componentA.execute(context))
+    .subscribeOn(scheduler)
+    .cache();  // 关键
+```
+
+### 7.3 避免阻塞操作
+
+组件内部应避免同步阻塞调用：
+
+```java
+// 不推荐：阻塞线程
+Either<String, Context> execute(Context context) {
+    String result = blockingHttpClient.get("/api/data");  // 阻塞
+    return Either.right(context);
+}
+
+// 推荐：异步调用
+Either<String, Context> execute(Context context) {
+    // 将阻塞操作委托给专门的线程池
+    CompletableFuture<String> future = asyncHttpClient.get("/api/data");
+    String result = future.join();  // 在 Reactor 线程池外阻塞
+    return Either.right(context);
+}
+```
+
+---
+
+## 八、监控与可观测性
+
+### 8.1 启动时报告
+
+框架启动时输出组件注册信息：
+
+```
+==================== 组件编排框架启动报告 ====================
+已注册的业务组件:
+  ✅ ParameterValidation - 参数校验
+  ✅ InventoryCheck - 库存检查
+  ✅ CreditCheck - 信用额度检查
+  总计: 15 个组件
+
+组件依赖关系图:
+  ParameterValidation (无依赖)
+  InventoryCheck -> [ParameterValidation]
+  CreditCheck -> [ParameterValidation]
+  OrderCreation -> [InventoryCheck, CreditCheck]
+=========================================================
+```
+
+### 8.2 执行日志
+
+框架记录每个组件的执行状态：
+
+```
+[DOMSVC_REQ] ParameterValidation.execute - 开始执行
+[DOMSVC_RESP] ParameterValidation.execute - 执行完成 (耗时: 5ms)
+[DOMSVC_REQ] InventoryCheck.execute - 开始执行 (等待: 2ms)
+[DOMSVC_REQ] CreditCheck.execute - 开始执行 (等待: 2ms)
+[DOMSVC_RESP] CreditCheck.execute - 执行完成 (耗时: 15ms)
+[DOMSVC_RESP] InventoryCheck.execute - 执行完成 (耗时: 20ms)
+[DOMSVC_REQ] OrderCreation.execute - 开始执行 (等待: 1ms)
+[DOMSVC_RESP] OrderCreation.execute - 执行完成 (耗时: 10ms)
+[DOMSVC_RESP] executeComponents - 全部完成 (总耗时: 52ms)
+```
+
+### 8.3 性能指标
+
+关键性能指标：
+
+- **总执行时间**：从开始到所有组件完成的时间
+- **组件等待时间**：组件提交到线程池到实际开始执行的时间
+- **组件执行时间**：组件实际执行耗时
+- **最大并发度**：同时执行的组件数量峰值
+
+---
+
+## 九、最佳实践
+
+### 9.1 组件设计原则
+
+**单一职责**：每个组件只做一件事
+
+```java
+// 好的设计
+class InventoryCheckComponent { }
+class PriceCalculationComponent { }
+
+// 不好的设计
+class InventoryAndPriceComponent { }  // 职责不单一
+```
+
+**无状态**：组件本身不持有状态，状态存储在上下文中
+
+```java
+// 好的设计
+class CreditCheckComponent {
+    Either<String, Context> execute(Context context) {
+        BigDecimal limit = creditService.getLimit(context.getUserId());
+        context.setCreditLimit(limit);  // 状态写入上下文
+        return Either.right(context);
+    }
+}
+
+// 不好的设计
+class CreditCheckComponent {
+    private BigDecimal creditLimit;  // 组件持有状态，并发不安全
+
+    Either<String, Context> execute(Context context) {
+        this.creditLimit = creditService.getLimit(context.getUserId());
+        return Either.right(context);
+    }
+}
+```
+
+**幂等性**：组件多次执行应该产生相同结果（框架通过 `.cache()` 保证只执行一次）
+
+### 9.2 依赖声明原则
+
+**最小依赖**：只声明真正需要的依赖
+
+```java
+// 组件 D 只需要读取组件 A 写入的数据，不需要声明对 B、C 的依赖
+@DependsOn(ComponentA.class)
+class ComponentD { }
+```
+
+**避免过度依赖**：减少依赖关系可以提高并发度
+
+```
+过度依赖：
+A → B → C → D → E  （串行，耗时 250ms）
+
+优化后：
+A → C
+A → D
+B → E
+（并发度提高，耗时 100ms）
+```
+
+### 9.3 上下文设计原则
+
+**字段隔离**：不同组件写入不同字段
+
+```java
+class OrderContext {
+    // 组件 A 写入
+    private Map<String, String> config;
+
+    // 组件 B 写入
+    private BigDecimal creditLimit;
+
+    // 组件 C 写入
+    private List<Promotion> promotions;
+
+    // 避免多个组件写入同一个字段（并发不安全）
+}
+```
+
+### 9.4 业务编排原则
+
+**合理组装**：根据业务场景合理选择组件
+
+```java
+// 好的做法：根据业务需求组装
+if (request.isVipOrder()) {
+    components.add(VipDiscountComponent.class);
+}
+
+// 不好的做法：盲目添加所有组件
+components.addAll(allComponents);  // 性能浪费
+```
+
+**套装复用**：提取常用组件组合
+
+```java
+// 好的做法：使用套装复用
+List<Class<?>> components = componentSets.compose(
+    Arrays.asList(
+        componentSets.basicValidation(),
+        componentSets.paymentComponents()
+    )
+);
+
+// 不好的做法：每次都手动列举
+List<Class<?>> components = Arrays.asList(
+    ComponentA.class,
+    ComponentB.class,
+    // ... 重复代码
+);
+```
+
+---
+
+## 十、框架扩展点
+
+### 10.1 自定义执行器
+
+支持不同业务场景使用不同的线程池：
+
+```java
+@Configuration
+public class ExecutorConfig {
+
+    @Bean("cpuIntensiveExecutor")
+    public Executor cpuIntensiveExecutor() {
+        // CPU 密集型任务：线程数 = CPU 核心数
+        return Executors.newFixedThreadPool(
+            Runtime.getRuntime().availableProcessors()
+        );
+    }
+
+    @Bean("ioIntensiveExecutor")
+    public Executor ioIntensiveExecutor() {
+        // IO 密集型任务：线程数 > CPU 核心数
+        return Executors.newFixedThreadPool(
+            Runtime.getRuntime().availableProcessors() * 2
+        );
+    }
+}
+
+@Service
+public class CpuIntensiveOrchestrator extends ReactorOrchestrator<Context> {
+    public CpuIntensiveOrchestrator(
+            List<BusinessComponent<Context>> components,
+            @Qualifier("cpuIntensiveExecutor") Executor executor) {
+        super(components, executor);
+    }
+}
+```
+
+### 10.2 自定义错误处理
+
+支持不同的错误处理策略：
+
+```java
+public interface ErrorHandler<C> {
+    Either<String, C> handle(Throwable error, C context);
+}
+
+// 示例：重试处理器
+public class RetryErrorHandler<C> implements ErrorHandler<C> {
+    public Either<String, C> handle(Throwable error, C context) {
+        // 实现重试逻辑
+    }
+}
+```
+
+### 10.3 自定义结果聚合
+
+支持不同的结果聚合策略：
+
+```java
+// 默认：任一失败则失败
+.reduce((r1, r2) -> r1.isLeft() ? r1 : r2)
+
+// 宽容模式：收集所有错误
+.reduce((r1, r2) -> {
+    if (r1.isLeft() && r2.isLeft()) {
+        return Either.left(r1.getLeft() + "; " + r2.getLeft());
+    }
+    return r1.isLeft() ? r1 : r2;
+})
+```
+
+---
+
+## 十一、多领域实例支持
+
+### 11.1 设计理念
+
+在实际应用中,不同业务领域(订单域、支付域、库存域、并网校验域等)应该有独立的组件集合和编排器实例,实现:
+
+- **领域隔离**: 不同领域的组件在独立的全局拓扑图中
+- **独立配置**: 每个领域可配置专属线程池
+- **类型安全**: 不同领域使用不同的上下文类型
+- **清晰边界**: 避免跨领域组件依赖混乱
+
+### 11.2 实现方式:显式配置(推荐)
+
+**方案特点**:
+- ✅ **完全类型安全**: 编译时检查,不同领域使用不同Context类型
+- ✅ **灵活配置**: 每个领域独立配置线程池、错误处理策略
+- ✅ **清晰明确**: 显式声明领域边界,代码可读性强
+- ✅ **易于扩展**: 新增领域只需新增配置类
+
+#### 步骤1: 定义领域组件标记接口
+
+```java
+/**
+ * 订单域组件接口
+ */
+public interface OrderComponent extends BusinessComponent<OrderContext> {}
+
+/**
+ * 支付域组件接口
+ */
+public interface PaymentComponent extends BusinessComponent<PaymentContext> {}
+
+/**
+ * 并网校验域组件接口
+ */
+public interface GridCheckComponent extends BusinessComponent<GridSubmitContext> {}
+```
+
+#### 步骤2: 组件实现领域接口
+
+```java
+/**
+ * 订单参数校验组件
+ */
+@Component
+public class OrderParameterValidationComponent implements OrderComponent {
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        if (context.getOrderId() == null) {
+            return Either.left("订单ID不能为空");
+        }
+        return Either.right(context);
+    }
+}
+
+/**
+ * 库存检查组件(依赖参数校验)
+ */
+@Component
+@DependsOn(OrderParameterValidationComponent.class)
+public class InventoryCheckComponent implements OrderComponent {
+
+    @Resource
+    private InventoryService inventoryService;
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        boolean available = inventoryService.checkStock(context.getProductId());
+        if (!available) {
+            return Either.left("库存不足");
+        }
+        return Either.right(context);
+    }
+}
+
+/**
+ * 支付金额校验组件
+ */
+@Component
+public class PaymentAmountCheckComponent implements PaymentComponent {
+
+    @Override
+    public Either<String, PaymentContext> execute(PaymentContext context) {
+        if (context.getAmount().compareTo(BigDecimal.ZERO) <= 0) {
+            return Either.left("支付金额必须大于0");
+        }
+        return Either.right(context);
+    }
+}
+```
+
+#### 步骤3: 配置领域编排器Bean
+
+```java
+@Configuration
+public class OrchestrationConfig {
+
+    /**
+     * 订单域编排器
+     * 使用专属线程池,优化订单处理性能
+     */
+    @Bean
+    public ReactorOrchestrator<OrderContext> orderOrchestrator(
+            List<OrderComponent> orderComponents,
+            @Qualifier("orderThreadPool") Executor orderExecutor) {
+
+        log.info("初始化订单域编排器,组件数量: {}", orderComponents.size());
+
+        return new ReactorOrchestrator<>(
+            new ArrayList<>(orderComponents),
+            orderExecutor
+        );
+    }
+
+    /**
+     * 支付域编排器
+     * 使用专属线程池,隔离支付业务
+     */
+    @Bean
+    public ReactorOrchestrator<PaymentContext> paymentOrchestrator(
+            List<PaymentComponent> paymentComponents,
+            @Qualifier("paymentThreadPool") Executor paymentExecutor) {
+
+        log.info("初始化支付域编排器,组件数量: {}", paymentComponents.size());
+
+        return new ReactorOrchestrator<>(
+            new ArrayList<>(paymentComponents),
+            paymentExecutor
+        );
+    }
+
+    /**
+     * 并网校验域编排器
+     * 并网业务量大,使用独立的大容量线程池
+     */
+    @Bean
+    public ReactorOrchestrator<GridSubmitContext> gridCheckOrchestrator(
+            List<GridCheckComponent> gridCheckComponents,
+            @Qualifier("gridSubmitThreadPool") Executor gridSubmitExecutor) {
+
+        log.info("初始化并网校验域编排器,组件数量: {}", gridCheckComponents.size());
+
+        return new ReactorOrchestrator<>(
+            new ArrayList<>(gridCheckComponents),
+            gridSubmitExecutor
+        );
+    }
+
+    /**
+     * 订单域专属线程池
+     * CPU密集型任务,线程数=CPU核心数
+     */
+    @Bean("orderThreadPool")
+    public Executor orderThreadPool() {
+        return new ThreadPoolExecutor(
+            Runtime.getRuntime().availableProcessors(),
+            Runtime.getRuntime().availableProcessors() * 2,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(500),
+            new ThreadFactoryBuilder().setNameFormat("order-orchestrator-%d").build(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+    }
+
+    /**
+     * 支付域专属线程池
+     * IO密集型任务(调用支付网关),线程数较多
+     */
+    @Bean("paymentThreadPool")
+    public Executor paymentThreadPool() {
+        return new ThreadPoolExecutor(
+            20,
+            50,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000),
+            new ThreadFactoryBuilder().setNameFormat("payment-orchestrator-%d").build(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+    }
+
+    /**
+     * 并网校验域专属线程池
+     * 业务量大,高并发场景
+     */
+    @Bean("gridSubmitThreadPool")
+    public Executor gridSubmitThreadPool() {
+        return new ThreadPoolExecutor(
+            30,
+            100,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(2000),
+            new ThreadFactoryBuilder().setNameFormat("grid-check-%d").build(),
+            new ThreadPoolExecutor.CallerRunsPolicy()
+        );
+    }
+}
+```
+
+#### 步骤4: 业务层使用领域编排器
+
+```java
+/**
+ * 订单服务
+ */
+@Service
+public class OrderService {
+
+    @Autowired
+    private ReactorOrchestrator<OrderContext> orderOrchestrator;
+
+    /**
+     * 处理普通订单
+     */
+    public Either<String, Order> processNormalOrder(OrderRequest request) {
+        OrderContext context = new OrderContext(request);
+
+        List<Class<? extends BusinessComponent<OrderContext>>> components = Arrays.asList(
+            OrderParameterValidationComponent.class,
+            InventoryCheckComponent.class,
+            CreditCheckComponent.class,
+            PriceCalculationComponent.class,
+            OrderCreationComponent.class
+        );
+
+        return orderOrchestrator.executeComponents(context, components)
+            .block()
+            .map(ctx -> ctx.getOrder());
+    }
+
+    /**
+     * 处理VIP订单
+     */
+    public Either<String, Order> processVipOrder(OrderRequest request) {
+        OrderContext context = new OrderContext(request);
+
+        List<Class<? extends BusinessComponent<OrderContext>>> components = Arrays.asList(
+            OrderParameterValidationComponent.class,
+            VipCreditCheckComponent.class,
+            InventoryCheckComponent.class,
+            VipDiscountComponent.class,
+            GiftPackageComponent.class,
+            PriceCalculationComponent.class,
+            OrderCreationComponent.class
+        );
+
+        return orderOrchestrator.executeComponents(context, components)
+            .block()
+            .map(ctx -> ctx.getOrder());
+    }
+}
+
+/**
+ * 支付服务
+ */
+@Service
+public class PaymentService {
+
+    @Autowired
+    private ReactorOrchestrator<PaymentContext> paymentOrchestrator;
+
+    /**
+     * 处理支付请求
+     */
+    public Either<String, PaymentResult> processPayment(PaymentRequest request) {
+        PaymentContext context = new PaymentContext(request);
+
+        List<Class<? extends BusinessComponent<PaymentContext>>> components = Arrays.asList(
+            PaymentAmountCheckComponent.class,
+            PaymentAccountValidationComponent.class,
+            RiskControlComponent.class,
+            PaymentChannelRoutingComponent.class,
+            PaymentExecutionComponent.class
+        );
+
+        return paymentOrchestrator.executeComponents(context, components)
+            .block()
+            .map(ctx -> ctx.getPaymentResult());
+    }
+}
+
+/**
+ * 并网校验服务
+ */
+@Service
+public class GridCheckService {
+
+    @Autowired
+    private ReactorOrchestrator<GridSubmitContext> gridCheckOrchestrator;
+
+    /**
+     * PC端并网提交校验
+     */
+    public Either<String, GridSubmitContext> checkPCGridSubmit(GridSubmitContext context) {
+
+        List<Class<? extends BusinessComponent<GridSubmitContext>>> components = Arrays.asList(
+            ParameterValidationComponent.class,
+            AgreementCheckComponent.class,
+            BlackListCheckComponent.class,
+            MarginCheckComponent.class,
+            CreditLineCheckComponent.class,
+            PolicyCheckComponent.class,
+            GridAttachmentCheckComponent.class
+        );
+
+        return gridCheckOrchestrator.executeComponents(context, components)
+            .block();
+    }
+}
+```
+
+### 11.3 多实例架构优势
+
+#### 性能隔离
+
+```
+传统方案(单一编排器):
+┌─────────────────────────────────────┐
+│  全局编排器 (共享线程池)              │
+│  ├── 订单组件 (50个)                 │
+│  ├── 支付组件 (30个)                 │
+│  ├── 库存组件 (20个)                 │
+│  └── 并网组件 (80个)                 │
+│  共享: 全局拓扑图(180个节点)          │
+│  问题: 并网业务量大,挤占其他业务资源  │
+└─────────────────────────────────────┘
+
+多实例方案(领域隔离):
+┌─────────────────────────────────────┐
+│  订单域编排器 (orderThreadPool)      │
+│  ├── 全局拓扑: 50个订单组件          │
+│  └── 筛选速度: ~50次比较             │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│  支付域编排器 (paymentThreadPool)    │
+│  ├── 全局拓扑: 30个支付组件          │
+│  └── 筛选速度: ~30次比较             │
+└─────────────────────────────────────┘
+
+┌─────────────────────────────────────┐
+│  并网域编排器 (gridThreadPool)       │
+│  ├── 全局拓扑: 80个并网组件          │
+│  └── 筛选速度: ~80次比较             │
+│  └── 独立大容量线程池,不影响其他域   │
+└─────────────────────────────────────┘
+
+优势:
+✅ 筛选性能提升: 180次比较 → 50/30/80次比较
+✅ 线程池隔离: 并网高峰不影响订单/支付
+✅ 故障隔离: 某个域故障不影响其他域
+✅ 独立监控: 每个域独立性能指标
+```
+
+#### 类型安全
+
+```java
+// ✅ 编译时类型检查,不同领域Context类型不同
+ReactorOrchestrator<OrderContext> orderOrchestrator;
+ReactorOrchestrator<PaymentContext> paymentOrchestrator;
+ReactorOrchestrator<GridSubmitContext> gridCheckOrchestrator;
+
+// ❌ 编译错误:类型不匹配
+orderOrchestrator.executeComponents(paymentContext, components);
+//                                  ^^^^^^^^^^^^^^
+// 编译错误: PaymentContext cannot be converted to OrderContext
+```
+
+#### 依赖关系清晰
+
+```
+传统方案(单一拓扑图):
+  所有组件混在一起,依赖关系复杂
+
+多实例方案(领域拓扑图):
+  订单域拓扑图:
+    ParameterValidation
+      ├── InventoryCheck
+      ├── CreditCheck
+      └── PriceCalculation
+            └── OrderCreation
+
+  支付域拓扑图:
+    PaymentAmountCheck
+      ├── AccountValidation
+      ├── RiskControl
+      └── ChannelRouting
+            └── PaymentExecution
+
+  领域内依赖清晰,避免跨域依赖混乱
+```
+
+### 11.4 共享组件处理
+
+某些通用组件可能被多个领域使用,有两种处理方式:
+
+#### 方式1: 每个领域独立实现(推荐)
+
+```java
+// 订单域的参数校验
+@Component
+public class OrderParameterValidationComponent implements OrderComponent {
+    public Either<String, OrderContext> execute(OrderContext context) {
+        // 订单特有的参数校验逻辑
+    }
+}
+
+// 支付域的参数校验
+@Component
+public class PaymentParameterValidationComponent implements PaymentComponent {
+    public Either<String, PaymentContext> execute(PaymentContext context) {
+        // 支付特有的参数校验逻辑
+    }
+}
+```
+
+**优势**: 领域完全独立,职责清晰
+
+#### 方式2: 通用组件多领域注册
+
+```java
+// 通用参数校验组件(同时实现多个领域接口)
+@Component
+public class CommonParameterValidationComponent
+    implements OrderComponent, PaymentComponent {
+
+    @Override
+    public Either<String, OrderContext> execute(OrderContext context) {
+        // 订单上下文校验
+    }
+
+    // 注意:需要类型区分,通常不推荐
+    public Either<String, PaymentContext> execute(PaymentContext context) {
+        // 支付上下文校验
+    }
+}
+```
+
+**问题**: 职责不清晰,不推荐。建议提取通用逻辑到Service层。
+
+### 11.5 最佳实践建议
+
+1. **按业务领域划分**: 订单域、支付域、库存域、物流域等
+2. **独立线程池配置**: 根据领域特点(CPU密集/IO密集)配置线程池
+3. **避免跨域依赖**: 组件依赖应该在领域内部
+4. **通用逻辑下沉**: 跨领域通用逻辑提取到Service层
+5. **监控独立配置**: 每个领域独立的性能监控和告警
+
+---
+
+## 十二、迁移指南
+
+### 11.1 从顺序执行迁移
+
+**原代码（顺序执行）**：
+
+```java
+public Either<String, Order> processOrder(OrderRequest request) {
+    // 参数校验
+    if (request.getOrderId() == null) {
+        return Either.left("订单ID不能为空");
+    }
+
+    // 库存检查
+    if (!inventoryService.checkStock(request.getProductId())) {
+        return Either.left("库存不足");
+    }
+
+    // 信用检查
+    BigDecimal creditLimit = creditService.getCreditLimit(request.getUserId());
+    if (creditLimit.compareTo(request.getAmount()) < 0) {
+        return Either.left("信用额度不足");
+    }
+
+    // 价格计算
+    BigDecimal finalPrice = priceService.calculatePrice(request);
+
+    // 创建订单
+    return orderService.createOrder(request, finalPrice);
+}
+```
+
+**迁移后（并发编排）**：
+
+```java
+// 1. 将每个步骤拆分为组件
+@Component
+class ParameterValidationComponent implements BusinessComponent<OrderContext> {
+    public Either<String, OrderContext> execute(OrderContext context) {
+        if (context.getOrderId() == null) {
+            return Either.left("订单ID不能为空");
+        }
+        return Either.right(context);
+    }
+}
+
+@Component
+@DependsOn(ParameterValidationComponent.class)
+class InventoryCheckComponent implements BusinessComponent<OrderContext> {
+    @Resource
+    private InventoryService inventoryService;
+
+    public Either<String, OrderContext> execute(OrderContext context) {
+        if (!inventoryService.checkStock(context.getProductId())) {
+            return Either.left("库存不足");
+        }
+        return Either.right(context);
+    }
+}
+
+@Component
+@DependsOn(ParameterValidationComponent.class)
+class CreditCheckComponent implements BusinessComponent<OrderContext> {
+    @Resource
+    private CreditService creditService;
+
+    public Either<String, OrderContext> execute(OrderContext context) {
+        BigDecimal creditLimit = creditService.getCreditLimit(context.getUserId());
+        if (creditLimit.compareTo(context.getAmount()) < 0) {
+            return Either.left("信用额度不足");
+        }
+        context.setCreditLimit(creditLimit);
+        return Either.right(context);
+    }
+}
+
+// 2. 在服务中使用编排器
+@Service
+public class OrderProcessService {
+
+    @Autowired
+    private ReactorOrchestrator<OrderContext> orchestrator;
+
+    public Either<String, Order> processOrder(OrderRequest request) {
+        OrderContext context = new OrderContext(request);
+
+        List<Class<? extends BusinessComponent<OrderContext>>> components = Arrays.asList(
+            ParameterValidationComponent.class,
+            InventoryCheckComponent.class,
+            CreditCheckComponent.class,
+            PriceCalculationComponent.class,
+            OrderCreationComponent.class
+        );
+
+        return orchestrator.executeComponents(context, components)
+            .block()
+            .map(ctx -> ctx.getOrder());
+    }
+}
+```
+
+**性能对比**：
+- 原代码（顺序执行）：200ms
+- 迁移后（并发执行）：80ms（库存检查和信用检查并发）
+
+---
+
+## 十二、总结
+
+### 12.1 核心优势
+
+1. **性能提升**：自动识别并发机会，最大化吞吐量
+2. **代码解耦**：组件化设计，单一职责，易于测试和维护
+3. **灵活编排**：业务层直接编排组件，无需配置策略
+4. **自动调度**：基于依赖关系自动排序，无需手动编排
+5. **可观测性**：完整的执行日志和依赖关系可视化
+6. **类型安全**：编译时检查，避免运行时错误
+
+### 12.2 适用场景
+
+- 复杂业务流程编排（订单处理、审批流程、数据校验）
+- 多步骤异步任务（ETL、报表生成、批量处理）
+- 需要并发优化的场景（高并发接口、性能敏感业务）
+- 需要灵活业务编排的场景（多渠道、多业务类型）
+
+### 12.3 使用建议
+
+**框架核心**（通用组件）：
+- 组件接口 `BusinessComponent<C>`
+- 依赖注解 `@DependsOn`
+- 并发编排器 `ReactorOrchestrator<C>`
+
+**业务使用**（自主编排）：
+- 在服务层直接调用 `orchestrator.executeComponents(context, components)`
+- 根据业务逻辑动态组装组件列表
+- 提取组件套装以便复用
+

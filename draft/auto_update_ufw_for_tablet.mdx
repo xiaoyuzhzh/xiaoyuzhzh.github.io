@@ -1,0 +1,299 @@
+---
+title: mac 自动更换 vps 的 ufw 白名单
+description: mac 配置脚本自动更换 vps 的 ufw 白名单，方便快速切换公网 IP
+---
+
+
+
+# 自动更新笔记本公网 IP 到 VPS（UFW 白名单）教程
+
+> 目标：
+> 无论笔记本连的是家里 Wi-Fi、公司、有线还是手机热点，都能**自动**把当前公网 IP 更新到 VPS 上的 UFW 白名单，让 SOCKS5 中转节点只允许这台笔记本访问。
+
+前提假设：
+
+- VPS：Debian 12，已安装 UFW + Dante（SOCKS5，监听端口 `1080`）。
+- SSH：本地已配置免密登录 VPS，例如 `ssh kiwi-vps` 可以连上。
+- UFW：已启用并允许 SSH 端口（例如 29690），1080 端口由脚本维护白名单。
+
+---
+
+## 一、在 VPS 上创建「添加当前 IP 到 UFW」脚本
+
+核心思路：
+
+- 从 SSH 会话中的环境变量 `SSH_CONNECTION` 里读出客户端 IP（笔记本当前公网 IP）；
+- 删除旧的 `laptop-ddns` 白名单规则；
+- 为端口 1080 添加新的允许规则。
+
+### 1.1 创建脚本 `/usr/local/bin/add_socks_ip.sh`
+
+在 VPS 上执行：
+
+```bash
+vim /usr/local/bin/add_socks_ip.sh
+```
+
+写入以下内容：
+
+```bash
+#!/bin/bash
+set -e
+PATH=/usr/sbin:/usr/bin:/bin:/usr/local/bin
+
+PORT=1080
+TAG="laptop-ddns"
+
+IP="$1"
+
+# 如果没有传 IP 参数，则尝试从 SSH_CONNECTION 里获取
+if [ -z "$IP" ] && [ -n "$SSH_CONNECTION" ]; then
+  # SSH_CONNECTION="client_ip client_port server_ip server_port"
+  set -- $SSH_CONNECTION
+  IP="$1"
+fi
+
+if [ -z "$IP" ]; then
+  echo "Usage: $0 <ip>  (or invoke via ssh so SSH_CONNECTION is set)"
+  exit 1
+fi
+
+# 删除旧的 laptop-ddns 规则
+ufw status numbered | grep "$TAG" | awk -F'[][]' '{print $2}' | sort -nr | while read num; do
+  ufw --force delete "$num"
+done
+
+# 新增当前 IP 规则
+ufw allow from "$IP" to any port "$PORT" proto tcp comment "$TAG"
+
+echo "[$(date '+%F %T')] laptop-ddns updated to $IP"
+```
+
+保存并赋予执行权限：
+
+```bash
+chmod +x /usr/local/bin/add_socks_ip.sh
+```
+
+### 1.2 在 VPS 上测试脚本
+
+1. 从笔记本 SSH 登录 VPS（直接连，不走 SOCKS 代理）：
+
+```bash
+ssh kiwi-vps
+```
+
+2. 在 VPS 上运行脚本：
+
+```bash
+/usr/local/bin/add_socks_ip.sh
+```
+
+3. 查看 UFW 规则：
+
+```bash
+ufw status
+```
+
+应该能看到类似：
+
+```text
+1080/tcp  ALLOW IN   221.12.xx.xx            # laptop-ddns
+```
+
+这里的 IP 就是笔记本当前网络的公网 IP。
+
+---
+
+## 二、在笔记本上创建「一键更新」脚本
+
+环境以 macOS 为例（你现在用的是 Mac）。
+
+### 2.1 创建脚本 `~/bin/update_vps_ufw_ip.sh`
+
+在本地执行：
+
+```bash
+mkdir -p ~/bin
+vim ~/bin/update_vps_ufw_ip.sh
+```
+
+写入以下内容：
+
+```bash
+#!/bin/bash
+set -e
+PATH=/usr/local/bin:/usr/bin:/bin
+
+echo "[$(date '+%F %T')] Updating laptop IP on VPS..."
+
+# 这里的 kiwi-vps 是 ~/.ssh/config 里的 Host 名
+ssh kiwi-vps "/usr/local/bin/add_socks_ip.sh"
+```
+
+保存后赋予执行权限：
+
+```bash
+chmod +x ~/bin/update_vps_ufw_ip.sh
+```
+
+### 2.2 手动测试
+
+在笔记本上运行：
+
+```bash
+~/bin/update_vps_ufw_ip.sh
+```
+
+然后在 VPS 上查看：
+
+```bash
+ufw status | grep 1080
+```
+
+应看到 1080 端口对应的 `laptop-ddns` 规则已经更新为当前公网 IP。
+
+---
+
+## 三、添加一个方便的别名（可选）
+
+在 macOS 上为脚本加一个 alias：
+
+```bash
+echo 'alias ufw-ip="$HOME/bin/update_vps_ufw_ip.sh"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+之后只需执行：
+
+```bash
+ufw-ip
+```
+
+就会自动更新 VPS 上 UFW 的 `laptop-ddns` 白名单 IP。
+
+---
+
+## 四、使用 LaunchAgent 在网络变化时自动执行（macOS）
+
+利用 macOS 的 LaunchAgent，在以下情况自动执行脚本：
+
+- 用户登录；
+- 网络状态变化（连上 Wi-Fi、切换网络等）。
+
+### 4.1 创建 LaunchAgent 配置文件
+
+在本地执行：
+
+```bash
+mkdir -p ~/Library/LaunchAgents
+vim ~/Library/LaunchAgents/com.example.ufw-ip.plist
+```
+
+写入以下内容（请按实际用户名调整路径）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 任务的唯一标识 -->
+    <key>Label</key>
+    <string>com.example.ufw-ip</string>
+
+    <!-- 要执行的脚本 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/example/bin/update_vps_ufw_ip.sh</string>
+    </array>
+
+    <!-- 登录后立即执行一次 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 当网络状态变化时自动拉起 -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <!-- 日志输出（可选） -->
+    <key>StandardOutPath</key>
+    <string>/Users/example/Library/Logs/ufw-ip.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/example/Library/Logs/ufw-ip.err</string>
+</dict>
+</plist>
+```
+
+注意：如果你的用户名不是 `example`，请把上面路径里的 `example` 改成你的实际用户名。
+
+### 4.2 加载 LaunchAgent
+
+执行：
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.example.ufw-ip.plist
+```
+
+之后不需要每次手动加载：
+
+- 每次登录这台 Mac，该 LaunchAgent 会自动启动；
+- `RunAtLoad = true`：登录时立即执行一次脚本；
+- `KeepAlive -> NetworkState = true`：网络状态变化时再次执行脚本。
+
+### 4.3 检查运行情况
+
+1. 查看是否已加载：
+
+```bash
+launchctl list | grep ufw-ip
+```
+
+若能看到 `com.example.ufw-ip` 即表示已加载。
+
+2. 查看本地日志：
+
+```bash
+tail -f ~/Library/Logs/ufw-ip.log
+```
+
+然后断开 Wi-Fi 再连上，看是否出现类似日志：
+
+```text
+[2025-12-01 17:20:01] Updating laptop IP on VPS...
+```
+
+3. 在 VPS 上查看 UFW：
+
+```bash
+ufw status | grep 1080
+```
+
+确认每次网络变化后，1080 端口的 `laptop-ddns` 规则会更新为新的公网 IP。
+
+---
+
+## 五、整体流程回顾
+
+1. **VPS 端：**
+- `/usr/local/bin/add_socks_ip.sh`：
+- 从 `SSH_CONNECTION` 或参数获取客户端 IP；
+- 删除旧的 `laptop-ddns` UFW 规则；
+- 为端口 1080 添加新的允许规则。
+
+2. **笔记本端（macOS）：**
+- `~/bin/update_vps_ufw_ip.sh`：
+- 通过 `ssh kiwi-vps "/usr/local/bin/add_socks_ip.sh"` 调用 VPS 脚本；
+- `~/Library/LaunchAgents/com.example.ufw-ip.plist`：
+- 登录时执行一次；
+- 网络状态变化时自动执行。
+
+3. **效果：**
+- 无论你在什么网络环境，只要换了网络，LaunchAgent 就会触发脚本；
+- VPS 上的 UFW 白名单总是跟着笔记本当前的公网 IP 更新；
+- SOCKS5 中转节点对这台笔记本（以及你另外配置的 DDNS / 固定 IP）开放，安全性和使用体验都兼顾。
+
+---

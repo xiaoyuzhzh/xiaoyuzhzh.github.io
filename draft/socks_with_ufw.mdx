@@ -1,0 +1,349 @@
+---
+title: 搭建 socks 代理并配置 UFW 防火墙
+description: 使用 socks 配置代理，并使用 UFW 防火墙来拦截，防止代理被刷
+---
+
+# Debian 12 上使用 UFW + Dante 搭建安全 SOCKS5 中转节点（含 DDNS 动态白名单）
+
+> 适用场景：VPS 上运行 socks5 代理，只允许自己家里的动态 IP（DDNS）和少数固定网络访问，通过防火墙白名单实现安全控制。
+
+假设环境：
+
+- 系统：Debian 12（KVM / 搬瓦工 等）
+- 用户：root（已经可以用 SSH 密钥登录）
+- SSH 端口：`22`（按自己实际修改）
+- SOCKS5 端口：`1080`
+- 家里宽带绑定的 DDNS 域名：`example.com`（按自己实际修改）
+
+---
+
+## 1. 系统更新与基础工具
+
+登录 VPS 后，先更新系统并安装基础工具：
+
+```bash
+apt update
+apt upgrade -y
+
+apt install -y vim ufw dnsutils htop dante-server
+```
+
+（`dnsutils` 用于 `dig` 命令解析 DDNS，`dante-server` 是 SOCKS5 服务端。）
+
+---
+
+## 2. SSH 加固（只允许密钥登录）
+
+编辑 SSH 配置：
+
+```bash
+vim /etc/ssh/sshd_config
+```
+
+确保包含以下内容（没有就添加）：
+
+```bash
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+PubkeyAuthentication yes
+```
+
+保存后重载 SSH 服务：
+
+```bash
+systemctl reload sshd
+```
+
+再开一个新终端测试用密钥能否正常登录（例如通过 `ssh kiwi-vps`），确认没问题后再关闭旧会话。
+
+---
+
+## 3. 启用 UFW 防火墙（先只放行 SSH）
+
+1. 查看状态（一般是 inactive）：
+
+```bash
+ufw status
+```
+
+2. 设置默认策略：
+
+```bash
+ufw default deny incoming
+ufw default allow outgoing
+```
+
+3. ** 放行当前 SSH 端口（以 22 为例）** ：
+
+```bash
+ufw allow 22/tcp
+```
+> 注意这里如果不打开 22 端口，则 SSH 登录会失败
+
+4. 启用 UFW：
+
+```bash
+ufw enable
+```
+
+5. 再次确认状态：
+
+```bash
+ufw status
+```
+
+此时只有 SSH 端口对外开放，其它全部拒绝。
+
+---
+
+## 4. 安装并配置 Dante（SOCKS5）
+
+### 4.1 创建专用认证用户
+
+创建一个只用于 SOCKS 认证的系统用户，禁止登录 shell：
+
+```bash
+adduser --disabled-login --gecos "" proxyuser
+chsh -s /usr/sbin/nologin proxyuser
+passwd proxyuser
+```
+
+记住这里设置的密码，客户端连接 socks5 时要用：
+
+- 用户名：`proxyuser`
+- 密码：上面 `passwd` 设置的那一串
+
+### 4.2 编写 `/etc/danted.conf`
+
+先备份默认配置：
+
+```bash
+mv /etc/danted.conf /etc/danted.conf.bak
+```
+
+检查 VPS 网卡名，一般是 `eth0`：
+
+```bash
+ip addr
+```
+
+假设网卡名为 `eth0`，编辑新配置：
+
+```bash
+vim /etc/danted.conf
+```
+
+写入以下内容（纯英文，无中文注释）：
+
+```dante
+logoutput: syslog
+
+internal: 0.0.0.0 port = 1080
+external: eth0
+
+user.notprivileged: nobody
+
+method: username
+socksmethod: username
+
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+```
+
+说明：
+
+- `internal`：监听 1080 端口，对所有地址提供服务。
+- `external`：出站使用的网卡，这里填 `eth0`；如果你的网卡名不同，请替换。
+- `method` / `socksmethod`：都使用系统用户名密码认证。
+
+### 4.3 启动并验证 Dante
+
+启动并设置开机自启：
+
+```bash
+systemctl enable --now danted
+systemctl status danted
+```
+
+确认监听端口：
+
+```bash
+ss -tulnp | grep 1080
+```
+
+如果看到 `danted` 在 `0.0.0.0:1080` 监听，说明 SOCKS5 已经跑起来了。
+
+---
+
+## 5. UFW + DDNS 动态白名单脚本
+
+目标：让端口 `1080` 只允许：
+
+- 家里宽带当前出口 IP（通过 DDNS 解析，例如 `example.com`）
+- 若干固定 IP / 网段（公司、其他可信网络）
+
+### 5.1 创建脚本 `/usr/local/bin/update_socks_whitelist.sh`
+
+    ```bash
+vim /usr/local/bin/update_socks_whitelist.sh
+```
+
+写入如下内容（根据实际修改 DDNS 和固定白名单）：
+
+```bash
+#!/bin/bash
+set -e
+
+# 为 cron 环境显式设置 PATH，以找到 ufw、dig 等命令
+PATH=/usr/sbin:/usr/bin:/bin:/usr/local/bin
+
+# 增加日志函数，方便记录时间
+log() {
+    echo "[$(date '+%F %T')] $*"
+}
+
+# DDNS 域名（家里宽带的动态域名）
+HOME_DDNS="example.com"
+
+# Dante 监听的端口
+PORT=1080
+
+# 固定白名单（公司、其他可信网络的出口 IP 或网段）
+STATIC_WHITELIST=(
+  "203.0.113.15"    # 示例：公司出口 IP
+  "192.0.2.0/24"    # 示例：某个网段
+)
+
+# 解析 DDNS 获取当前家里出口 IP
+NEW_IP=$(dig +short "$HOME_DDNS" @8.8.8.8 | tail -n 1)
+
+# 标签，用于识别动态规则，方便删除
+RULE_TAG="socks-ddns"
+
+# 删除旧的动态规则（带有 RULE_TAG 注释）
+ufw status numbered | grep "$RULE_TAG" | awk -F'[][]' '{print $2}' | sort -nr | while read num; do
+    ufw --force delete "$num"
+done
+log "Old socks-ddns rule(s) deleted"
+
+# 添加固定白名单（如果还没存在就添加）
+for ip in "${STATIC_WHITELIST[@]}"; do
+    if ! ufw status | grep -q "$PORT.*ALLOW.*$ip"; then
+        ufw allow from "$ip" to any port "$PORT" proto tcp
+        log "Static rule added for $ip"
+    fi
+done
+
+# 添加新的动态规则（当前家里出口 IP）
+if [ -n "$NEW_IP" ]; then
+    ufw allow from "$NEW_IP" to any port "$PORT" proto tcp comment "$RULE_TAG"
+    log "Dynamic rule added for $HOME_DDNS -> $NEW_IP"
+fi
+```
+
+保存后赋予执行权限：
+
+```bash
+chmod +x /usr/local/bin/update_socks_whitelist.sh
+```
+
+### 5.2 手动运行一次脚本验证
+
+```bash
+/usr/local/bin/update_socks_whitelist.sh
+ufw status
+```
+
+预期输出类似：
+
+```text
+Status: active
+
+To                         Action      From
+--                         ------      ----
+22/tcp                  ALLOW       Anywhere
+1080/tcp                   ALLOW       203.0.113.15
+1080/tcp                   ALLOW       192.0.2.0/24
+1080/tcp                   ALLOW       183.158.72.223        # socks-ddns
+22/tcp (v6)             ALLOW       Anywhere (v6)
+```
+
+其中 `183.158.72.223` 就是当前 `example.com` 解析出来的家里出口 IP。
+
+如果之前曾经执行过 `ufw allow 1080/tcp` 这样的“全开放”的规则，建议删除：
+
+    ufw delete allow 1080/tcp
+
+确保只有带 IP 限制的规则存在。
+
+---
+
+## 6. 配置 cron 定时更新 DDNS 白名单
+
+让脚本每 5 分钟自动跑一次，跟随 DDNS 更新家里 IP。
+
+编辑 root 的 crontab：
+
+```bash
+crontab -e
+```
+
+在文件中添加一行（建议同时指定 PATH，虽然脚本本身也写了）：
+
+```bash
+PATH=/usr/sbin:/usr/bin:/bin:/usr/local/bin
+*/5 * * * * /usr/local/bin/update_socks_whitelist.sh >/var/log/update_socks_whitelist.log 2>>&1
+```
+
+保存退出。之后 cron 会每 5 分钟自动执行一次脚本。
+
+你可以通过查看日志检查是否在运行：
+
+```bash
+tail -f /var/log/update_socks_whitelist.log
+```
+
+或者在不同时间点看 `ufw status`，确认 `socks-ddns` 规则的 IP 会随 DDNS 变化而更新。
+
+---
+
+## 7. 验证整体效果
+
+1. **从家里宽带网络测试：**
+
+ - 客户端配置 SOCKS5：
+  - 服务器：`example.com`
+  - 端口：`1080`
+  - 用户名：`proxyuser`
+  - 密码：`passwd proxyuser` 时设置的密码
+ - 应正常连接上，并能通过代理访问外网。
+
+2. **从非白名单网络测试（例如手机 4G 或朋友家网络）：**
+
+ - 使用相同配置尝试连接 1080 端口，应连接失败（连接超时），说明 UFW 白名单生效。
+
+3. **在 VPS 上查看登录来源 IP：**
+
+想确认当前 SSH 会话的外网 IP，可以：
+
+```bash
+last -a | head -n 5
+who am i
+```
+
+---
+
+到此为止，你已经在 Debian 12 上完成了：
+
+- SSH 仅密钥登录 + UFW 基础防火墙
+- Dante SOCKS5 代理（用户名密码认证）
+- 基于 UFW 的 DDNS + 静态 IP 白名单自动维护脚本（cron 定时执行）
+
+后续如果需要新增可访问网络，只需编辑 `/usr/local/bin/update_socks_whitelist.sh`，在 `STATIC_WHITELIST` 中添加新的 IP 或 CIDR，再手动运行一次脚本或等待下一次 cron 即可。

@@ -1,0 +1,102 @@
+---
+title: JSR 使用方法
+description: 介绍如何使用 Java Flight Recorder (JFR) 进行性能分析
+---
+
+# Java Flight Recorder (JFR) 实战速查手册
+
+JFR 是 JVM 内置的低开销监控工具（生产环境可用，性能损耗通常 < 1%）。适用于分析 CPU 热点、内存泄漏、锁竞争等问题。
+
+## 1. 快速检查环境
+
+在开始之前，确保你的 JDK 支持 JFR（OpenJDK 8u262+ 或 JDK 11+ 已内置）。
+
+```bash
+# 检查是否支持 JFR (如果输出 FlightRecorder = false 或 true 均代表支持)
+java -XX:+PrintFlagsFinal -version | grep FlightRecorder
+
+# 如果不支持，应该会输出
+Error: VM option 'FlightRecorder' is experimental and must be enabled via -XX:+UnlockCommercialFeatures.
+
+# 如果支持，会有类似下面的输出，后面的true 和 false 只是代表是否启用，不影响单独使用 jcmd 执行。
+    bool FlightRecorder                          = true        
+```
+
+---
+
+## 2. 场景一：分析正在运行的程序 (推荐)
+
+无需重启应用，使用 `jcmd` 命令动态控制。
+
+### 步骤 1：找到进程 ID (PID)
+```bash
+jps -l
+# 或者使用 top
+top
+```
+
+### 步骤 2：开始录制 (Start)
+假设 PID 为 `12345`，录制 60 秒，结果保存到 `/tmp` 目录。
+
+```bash
+# 基础用法 (默认配置)
+jcmd 12345 JFR.start duration=60s filename=/tmp/my_trace.jfr
+
+# 进阶用法 (指定 settings=profile 以获取更详细的采样，适合查 CPU)
+jcmd 12345 JFR.start settings=profile duration=60s filename=/tmp/cpu_profile.jfr
+```
+
+### 步骤 3：查看状态 (可选)
+如果没设置 `duration`，或者想看录制进度：
+```bash
+jcmd 12345 JFR.check
+```
+
+### 步骤 4：手动停止/导出 (如果不设置 duration)
+如果你在 Start 时没加 duration 参数，需要手动停止并 dump 文件：
+```bash
+# 导出数据到文件
+jcmd 12345 JFR.dump filename=/tmp/manual_dump.jfr
+
+# 停止录制
+jcmd 12345 JFR.stop
+```
+
+---
+
+## 3. 场景二：随应用启动开启
+
+适用于难以捕捉的**启动阶段问题**，或在 Docker/K8s 容器中自动开启。
+
+在 Java 启动参数 (`JAVA_OPTS`) 中添加：
+
+```bash
+-XX:StartFlightRecording=disk=true,dumponexit=true,filename=/tmp/app_startup.jfr,duration=120s,settings=profile
+```
+
+**参数解释：**
+* `disk=true`: 数据写入磁盘缓存（避免占用过多内存）。
+* `dumponexit=true`: 程序崩溃或退出时自动保存文件。
+* `duration=120s`: 只录制启动后的前 120 秒（如果不加则一直录制）。
+
+---
+
+## 4. 结果分析工具
+
+拿到 `.jfr` 文件后，下载到本地电脑使用以下工具打开：
+
+1.  **JDK Mission Control (JMC)** (官方推荐)
+    * 功能最全，支持火焰图、内存分配分析、IO 分析。
+    * 下载地址：[Adoptium JMC 下载](https://adoptium.net/jmc/)
+2.  **IntelliJ IDEA** (方便快捷)
+    * 直接将 `.jfr` 文件拖入 IDEA 窗口即可。
+    * 支持查看 CPU 火焰图和调用树。
+
+---
+
+## 5. 常见问题 (FAQ)
+
+* **Q: Oracle JDK 8 老版本报错 `Error: VM option 'FlightRecorder' is experimental...`**
+    * **A:** 老版本 Oracle JDK 是商业收费功能，需添加启动参数：`-XX:+UnlockCommercialFeatures -XX:+FlightRecorder`。建议升级到 OpenJDK 8u262+ (如 Temurin, Corretto) 即可免费使用。
+* **Q: 生产环境可以用吗？**
+    * **A:** 可以。JFR 是基于事件采样的，对应用性能影响极小（通常在 1% 左右），是排查线上问题的首选工具。

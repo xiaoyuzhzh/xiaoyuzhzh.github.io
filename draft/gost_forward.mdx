@@ -1,0 +1,117 @@
+---
+title: GOST 中转节点搭建笔记
+description: GOST 中转节点搭建笔记
+---
+
+# GOST 中转节点搭建笔记 (Shadowsocks + HTTP Relay)
+
+## 1. 架构逻辑
+
+为了解决本地直接连接落地代理效果差、易断连的问题，使用 VPS 作为中转跳板。
+
+* **链路：** `Stash (本地)` -> `Shadowsocks (VPS)` -> `GOST (转发)` -> `HTTP 代理 (落地)`
+* **优势：**
+    * **防断连：** SSH 走 VPS 直连，代理流量走隧道，落地挂了不影响管理 VPS。
+    * **抗干扰：** 入口使用 Shadowsocks (AEAD) 加密，防止 GFW 主动探测和协议识别。
+    * **高并发：** 通过系统参数优化，支持大量并发连接，防止 IO Timeout。
+
+## 2. 服务端配置 (VPS)
+
+### 2.1 环境准备
+* **工具：** GOST v2.11.5 (Linux amd64)
+* **端口：** `49283` (高位随机端口，避开 1080)
+* **协议：** Shadowsocks (`ss+aead`)
+
+### 2.2 安装 GOST
+```bash
+wget [https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz](https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz)
+gzip -d gost-linux-amd64-2.11.5.gz
+chmod +x gost-linux-amd64-2.11.5
+sudo mv gost-linux-amd64-2.11.5 /usr/local/bin/gost
+```
+
+### 2.3 配置 Systemd 服务 (开机自启)
+创建服务文件 `/etc/systemd/system/gost.service`：
+
+```ini
+[Unit]
+Description=GOST Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=3
+
+# === 关键优化：解除连接数限制，防止 io timeout ===
+LimitNOFILE=65535
+
+# === 启动命令 ===
+# -L: 本地监听 (Shadowsocks / aes-256-gcm / 端口 49283 / 密码自设)
+# -F: 转发给落地 (替换为落地代理的真实信息)
+# 注意：即使落地是 HTTPS，-F 协议头通常也写 http
+ExecStart=/usr/local/bin/gost \
+    -L "ss://aes-256-gcm:JxWd-gy-QVNDx29@:49283" \
+    -F "http://落地账号:落地密码@落地IP:端口"
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 2.4 启动服务
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable gost
+sudo systemctl start gost
+sudo systemctl status gost
+```
+
+## 3. 安全防护 (防火墙)
+
+为了防止 GFW 主动探测（Active Probing），建议**仅允许特定 IP** 连接代理端口。
+
+### UFW (Ubuntu/Debian)
+```bash
+# 1. 允许家里 IP 访问代理端口 (先查一下自己的公网 IP)
+sudo ufw allow from 114.114.114.114 to any port 49283 proto tcp
+
+# 2. 确保之前没有允许所有 IP (如果有 allow 49283 这种规则需删除)
+sudo ufw status numbered
+sudo ufw delete <规则序号>
+```
+
+> **注意：** 如果家里是动态 IP，重启光猫后记得更新此规则，否则会连不上。
+
+## 4. 客户端配置 (Stash / Clash)
+
+在 Stash 或 Clash 的配置文件 (`.yaml`) 中添加节点。**注意 YAML 键名全小写**。
+
+```yaml
+proxies:
+  - name: 'VPS-Relay-SS'
+    type: ss                # 必须是小写 ss
+    server: 'vps.xiaoyuzhzh.com' # 你的 VPS 域名或 IP
+    port: 49283             # 对应 VPS 监听端口
+    cipher: 'aes-256-gcm'   # 必须是小写
+    password: 'JxWd-gy-QVNDx29' # 你的 SS 密码
+    udp: false              # 关键：落地是 HTTP 代理不支持 UDP，必须关闭以免卡顿
+```
+
+## 5. 故障排查清单
+
+如果遇到卡顿或断连，按以下顺序检查：
+
+1.  **SSH 是否卡顿？**
+    * 本地终端执行 `ping vps_ip`，如果出现 `Request timeout` (丢包 > 2%)，说明是线路问题，与配置无关。
+2.  **连不上代理？**
+    * 检查家里公网 IP 是否变了（防火墙拦截）。
+    * VPS 上执行 `systemctl status gost` 看服务是否活着。
+3.  **网页打开转圈？**
+    * 检查 Stash 里该节点是否关闭了 UDP (`udp: false`)。
+    * 检查 VPS 的连接数限制是否已生效 (`ulimit -n` 应 > 1024)。
+
+---
+
+### 💡 进阶：如果 SS 被封锁
+如果后续端口被封，只需修改 Systemd 里的启动命令，将 `ss://` 改为 `ss+ws://`，并在客户端开启 Websocket 插件即可（伪装成 HTTP 流量）。

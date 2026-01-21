@@ -1,5 +1,5 @@
 ---
-title: JSR 使用方法
+title: JFR 使用方法
 description: 介绍如何使用 Java Flight Recorder (JFR) 进行性能分析
 ---
 
@@ -24,7 +24,7 @@ Error: VM option 'FlightRecorder' is experimental and must be enabled via -XX:+U
 
 ---
 
-## 2. 场景一：分析正在运行的程序 (推荐)
+## 2. 场景一：分析正在运行的程序，适用于未开启录制，要现场录制的场景 (推荐)
 
 无需重启应用，使用 `jcmd` 命令动态控制。
 
@@ -64,8 +64,9 @@ jcmd 12345 JFR.stop
 
 ---
 
-## 3. 场景二：随应用启动开启
+## 3. 场景二：随应用启动开启，保持录制状态
 
+### 启动录制
 适用于难以捕捉的**启动阶段问题**，或在 Docker/K8s 容器中自动开启。
 
 在 Java 启动参数 (`JAVA_OPTS`) 中添加：
@@ -78,6 +79,17 @@ jcmd 12345 JFR.stop
 * `disk=true`: 数据写入磁盘缓存（避免占用过多内存）。
 * `dumponexit=true`: 程序崩溃或退出时自动保存文件。
 * `duration=120s`: 只录制启动后的前 120 秒（如果不加则一直录制）。
+
+### dump录制结果
+```bash
+#快速 dump10 分钟内容
+jcmd 1 JFR.dump filename=/tmp/last_10m.jfr begin=-10m
+#20 分钟
+jcmd 1 JFR.dump filename=/tmp/last_20m.jfr begin=-20m
+#30 分钟
+jcmd 1 JFR.dump filename=/tmp/last_30m.jfr begin=-30m
+```
+
 
 ---
 

@@ -1,0 +1,94 @@
+---
+title: 使用 jfr 排查内存泄露
+description: 使用 jfr 排查可能存在的内存泄露或者大量占用内存的业务
+---
+
+```markdown
+# JFR 内存泄漏与高频 Full GC 排查实战手册
+
+本手册适用于排查 **“线上偶发 Full GC”**、**“业务逻辑导致内存暴涨”** 等场景。JFR 相比 Heap Dump 开销极低，适合生产环境持续监控。
+
+## 1. 准备工作
+
+确保你的 JDK 版本支持 JFR（OpenJDK 8u262+ 或 JDK 11+ 已内置）。
+
+```bash
+# 检查是否支持 (输出 false/true 均代表支持)
+java -XX:+PrintFlagsFinal -version | grep FlightRecorder
+```
+
+---
+
+## 2. 步骤一：开启“黑匣子” (持续录制)
+
+推荐在应用启动后，或者发现异常迹象时立刻执行。这将开启一个基于磁盘的环形缓冲区，**不会** 占用大量堆内存。
+
+```bash
+# 假设 PID 为 1
+# 关键参数解释：
+# settings=profile : 开启详细监控（包含 TLAB 内存分配、锁竞争），排查内存问题必须开这个！
+# disk=true        : 数据写入磁盘临时目录，不占堆内存。
+# maxage=2h        : 只保留最近 2 小时的录像 (循环覆盖)。
+# maxsize=1g       : 限制文件总大小不超过 1GB。
+
+jcmd 1 JFR.start name=monitor settings=profile disk=true maxage=2h maxsize=1g
+```
+
+> **K8s 环境特别提示**：为了防止 Pod 重启导致数据丢失，建议添加 `repositorypath` 参数指定挂载卷路径：
+> `jcmd 1 JFR.start ... repositorypath=/mnt/cloud-disk/jfr-repo`
+
+---
+
+## 3. 步骤二：案发后“取证” (导出数据)
+
+当监控报警 (CPU 飙高或 Full GC 频繁) 时，**不需要停止服务**，直接把最近 30 分钟的数据“剪辑”出来。
+
+```bash
+# 从名为 monitor 的录制中，提取最近 30 分钟的数据
+# begin=-30m : 重点参数，回溯过去 30 分钟
+jcmd 1 JFR.dump name=monitor filename=/tmp/memory_leak_analysis.jfr begin=-30m
+```
+
+---
+
+## 4. 步骤三：使用 JMC 分析 (抓捕元凶)
+
+下载导出的 `.jfr` 文件，使用 **JDK Mission Control (JMC)** 打开。
+
+### 🎯 核心视图：Allocation in new TLAB
+
+这是排查高内存占用的**第一现场**。
+
+1.  **进入视图**：在左侧导航栏选择 `Java Application` -> `Allocation in new TLAB`。
+    * *注意：不要看 "Thread Allocation Statistics"，那是累计值，干扰项太多。*
+2.  **聚焦时间**：在上方时间轴，框选 Full GC 发生前的那 **10~60 秒**。
+3.  **寻找大户**：
+    * 在列表中按 **Total Size** (总分配大小) 倒序排列。
+    * 排在第一位的线程/类，就是当前的“内存刺客”。
+4.  **定位代码 (关键一步)**：
+    * 选中那个分配最高的行。
+    * **点击底部标签页 `Stack Trace` (堆栈追踪)**。
+    * 这里会精确显示是**哪一行业务代码** (Controller/Service) 在疯狂申请对象。
+
+### 🔥 辅助视图：Flame Graph (火焰图)
+
+如果列表太长看不清，切换到 `Flame Graph` 视图：
+* 选择 Attribute 为 `Allocation in new TLAB`。
+* **最宽的那个平顶**，就是吃内存最凶的方法。
+
+---
+
+## 5. 特殊情况：Pod 已崩溃重启
+
+如果 Pod 因为 OOM 被 Kill 了，只要配置了 `disk=true` 且挂载了云盘，数据还能救回来。
+
+1.  进入挂载了云盘的新 Pod。
+2.  找到 JFR 仓库目录 (通常是 `/tmp/` 或你指定的 `repositorypath`)。
+3.  寻找 **上一个时间戳** 的文件夹 (即挂掉的那个进程遗留的)。
+4.  将文件夹内的 chunks (`.jfr` 分块文件) 全部下载到本地。
+5.  **合并文件** (推荐在本地使用 JDK 11+ 的 `jfr` 命令)：
+    ```bash
+    jfr assemble /path/to/downloaded_chunks/ output_restored.jfr
+    ```
+6.  用 JMC 打开修复后的文件，重点看最后几分钟的记录。
+```

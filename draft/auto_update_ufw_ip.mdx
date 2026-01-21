@@ -1,0 +1,151 @@
+---
+title: macOS 自动上报公网 IP 到 VPS（UFW 白名单）
+description: macOS 自动上报公网 IP 到 VPS（UFW 白名单）简明说明
+---
+
+# macOS 自动上报公网 IP 到 VPS（UFW 白名单）简明说明
+
+# 教程：在 macOS 上实现“网络变化 → 自动更新 VPS 的 UFW 白名单”
+
+目标：  
+当 macOS 的网络变为可用或发生切换时，自动通知 VPS；由 VPS 端脚本把“当前客户端公网 IP”加入 UFW 防火墙白名单，用于动态放行 SOCKS  等端口。
+
+---
+
+## 一、整体思路（先理解 3 件事）
+
+1. **触发点在 macOS**
+   - 使用 `launchd`
+   - 监听网络状态（NetworkState）
+
+2. **IP 不在 macOS 取**
+   - 由 VPS 端从 SSH 连接中识别客户端来源 IP
+   - 避免依赖第三方公网 IP API
+
+3. **真正改防火墙的只在 VPS**
+   - macOS 只负责触发
+   - 所有安全操作集中在服务器
+
+---
+
+## 二、VPS 端：准备“加白名单”的脚本
+
+### 1. 脚本位置
+建议放在：
+
+- `/usr/local/bin/add_socks_ip.sh`
+
+### 2. 脚本要做的事
+逻辑顺序：
+
+1. 从 SSH 环境变量中获取客户端 IP
+2. 判断该 IP 是否已经存在于 UFW 规则中
+3. 若不存在，则放行指定端口
+4. 可选：给规则加备注（方便识别）
+
+示意伪代码：
+
+- 读取 `SSH_CONNECTION`
+- 提取第一个字段作为客户端 IP
+- 执行 `ufw allow from <ip> to any port <PORT>`
+- 同 IP 已存在则直接退出
+
+> 该脚本通常需要 root 权限或 sudo 配置。
+
+---
+
+## 三、macOS 端：编写触发脚本
+
+### 1. 本地脚本路径
+例如：
+
+- `~/bin/update_vps_ufw_ip.sh`
+
+### 2. 脚本职责（只做一件事）
+- 通过 SSH 登录 VPS
+- 执行 VPS 端的 `add_socks_ip.sh`
+
+示意逻辑：
+
+- 设置可靠的 `PATH`
+- 执行：
+  - `ssh <vps-alias> "/usr/local/bin/add_socks_ip.sh"`
+
+说明：
+- 不在本地获取公网 IP
+- 不在本地写任何防火墙逻辑
+
+---
+
+## 四、macOS 端：使用 launchd 监听网络变化
+
+### 1. LaunchAgent 文件位置
+
+- `~/Library/LaunchAgents/com.<user>.ufw-ip.plist`
+
+### 2. 关键配置点
+
+必须包含：
+
+- `ProgramArguments`
+  - 指向 `update_vps_ufw_ip.sh`
+- `RunAtLoad = true`
+- `KeepAlive -> NetworkState = true`
+  - 表示仅在网络可用时触发
+
+可选但推荐：
+
+- `StandardOutPath`
+- `StandardErrorPath`
+
+---
+
+## 五、启用与验证
+
+### 1. 加载 LaunchAgent
+- `launchctl load ~/Library/LaunchAgents/com.<user>.ufw-ip.plist`
+
+### 2. 触发方式
+- 切换 Wi-Fi
+- 插拔网线
+- 关闭/打开网络
+- 重新登录 macOS
+
+### 3. 验证
+- macOS：
+  - 查看 LaunchAgent 日志
+- VPS：
+  - `ufw status`
+  - 确认出现新的客户端 IP 规则
+
+---
+
+## 六、常见问题（只保留关键的）
+
+### 1. SSH 连接被 reset
+- 多发生在 UFW reload 时
+- 属正常现象
+
+### 2. 频繁触发
+- 网络抖动会导致多次执行
+- 建议在 VPS 脚本中做 IP 去重
+
+### 3. 权限问题
+- VPS 脚本需有修改 UFW 的权限
+- 推荐使用 sudo + NOPASSWD
+
+---
+
+## 七、最终效果
+
+完成后，你将拥有：
+
+- 一个 macOS LaunchAgent
+- 一个本地触发脚本
+- 一个 VPS 防火墙更新脚本
+
+它们组合在一起，实现：
+
+**macOS 网络变化 → VPS 自动更新 UFW 白名单**
+
+这是一个简单、可靠、易维护的动态访问控制方案。

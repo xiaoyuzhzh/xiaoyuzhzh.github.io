@@ -1,0 +1,148 @@
+---
+title: 发布 npm 包完整流程
+description: 从零开始发布一个 npm 包，包含开源协议选择、package.json 配置、2FA 认证、版本管理和 npx 缓存等实践要点。
+---
+
+# 发布 npm 包完整流程
+
+## 1. 开源协议选择
+
+推荐使用 **MIT License**，最宽松的开源协议：
+- 允许任何人自由使用、修改、商用、分发
+- 唯一要求：保留版权声明
+- 不建议用无 scope 的通用包名（如 `mcp-jumpserver`），避免占用可能被官方使用的名字
+
+创建 `LICENSE` 文件：
+
+```
+MIT License
+
+Copyright (c) 2025 your-name
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## 2. package.json 关键字段
+
+```json
+{
+  "name": "@your-username/package-name",
+  "version": "0.1.0",
+  "description": "一句话描述",
+  "license": "MIT",
+  "author": "your-username",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/package-name.git"
+  },
+  "keywords": ["关键词1", "关键词2"],
+  "bin": {
+    "package-name": "src/index.js"
+  },
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
+```
+
+**几个要点：**
+- 用 scoped 包名 `@username/package-name`，避免占用公共命名空间，也明确归属
+- `bin` 字段定义 CLI 入口，npx 通过它找到可执行命令
+- `files` 字段控制发布哪些文件，排除 `node_modules`、测试文件等
+- 依赖版本用 `^` 锁定主版本，避免用 `latest`
+
+---
+
+## 3. 发布流程
+
+### 3.1 登录 npm
+
+```bash
+npm login
+```
+
+> npm 现在强制要求 2FA，且只支持 Security Key（WebAuthn），不再支持 TOTP（Authenticator App）。
+> Mac 用户可以直接用 Touch ID 注册，如果开启了 iCloud 钥匙串，Passkey 会自动同步到其他 Apple 设备。
+
+### 3.2 检查包名是否可用
+
+```bash
+npm view @your-username/package-name
+```
+
+返回 404 说明可用。
+
+### 3.3 发布
+
+scoped 包默认 private，必须加 `--access public`：
+
+```bash
+npm publish --access public
+```
+
+> **注意：** 如果在包本身的项目目录下执行 `npx -y @your-username/package-name`，npx 会解析到本地 `package.json` 而不是从 npm 下载，导致命令找不到。在其他目录使用是正常的。
+
+---
+
+## 4. 版本管理
+
+npm 遵循语义化版本（SemVer）：
+
+| 命令 | 示例 | 适用场景 |
+|---|---|---|
+| `npm version patch` | `0.1.0` → `0.1.1` | bug 修复 |
+| `npm version minor` | `0.1.0` → `0.2.0` | 新功能（向后兼容） |
+| `npm version major` | `0.1.0` → `1.0.0` | 破坏性变更 |
+
+`npm version` 命令会自动修改 `package.json` 并打 git tag。
+
+**相同版本不能重复发布**，npm 会报 `403` 错误。
+
+查看已发布的所有版本：
+
+```bash
+npm view @your-username/package-name versions
+```
+
+---
+
+## 5. npx 缓存
+
+npx 有本地缓存，第一次下载后不会每次都检查更新。
+
+```bash
+# 查看本地缓存了哪个版本
+ls $(npm config get cache)/_npx/
+
+# 强制清除 npx 缓存（获取最新版本）
+npx clear-npx-cache
+```
+
+如果想固定使用某个版本：
+
+```bash
+npx -y @your-username/package-name@0.1.1
+```

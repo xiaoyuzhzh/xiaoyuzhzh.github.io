@@ -91,10 +91,10 @@ sudo ufw delete <规则序号>
 proxies:
   - name: 'VPS-Relay-SS'
     type: ss                # 必须是小写 ss
-    server: 'vps.xiaoyuzhzh.com' # 你的 VPS 域名或 IP
-    port: 49283             # 对应 VPS 监听端口
+    server: 'xx.com' # 你的 VPS 域名或 IP
+    port: 2233             # 对应 VPS 监听端口
     cipher: 'aes-256-gcm'   # 必须是小写
-    password: 'JxWd-gy-QVNDx29' # 你的 SS 密码
+    password: 'password' # 你的 SS 密码
     udp: false              # 关键：落地是 HTTP 代理不支持 UDP，必须关闭以免卡顿
 ```
 

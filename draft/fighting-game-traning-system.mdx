@@ -1,0 +1,124 @@
+---
+title: 格斗游戏训练系统设计思路
+description: 格斗游戏训练系统设计思路
+---
+
+# 街霸6 格斗训练系统 (F.G.T.M.S.) 设计概要
+
+**项目代号:** F.G.T.M.S. (Fighting Game Taxonomy & Mastery System)
+**核心理念:** 从“静态备忘录”进化为“基于认知科学的动态私人教练”。
+**理论基础:** 刻意练习 (Deliberate Practice) + 运动学习间隔重复系统 (Motor Learning SRS)。
+
+---
+
+## 一、 核心专利创新点 (Patentable Claims)
+
+### 1. 结构化情境存储 (Situation-Based Storage)
+* **创新点:** 将非结构化的格斗画面转化为“情境 (Situation) - 解法 (Solution)”的二元数据模型。
+* **价值:** 解决了格斗知识碎片化问题，支持多维索引（确反、压起身、对策）。
+
+### 2. 动态精度衰退算法 (Precision-Based Decay Algorithm)
+* **创新点:** 区别于传统背单词软件的“记忆/遗忘”二元判定，引入**“动作执行精度 (Precision)”**作为计算间隔的核心变量。
+* **价值:** 将 SRS 算法成功移植到“肌肉记忆”训练领域。
+
+### 3. 双重归因分流机制 (Dual-Attribution Workflow)
+* **创新点:** 训练失败时，通过交互区分是“认知遗忘 (脑没记住)”还是“运动失误 (手没跟上)”，并据此生成不同的补习策略（背诵 vs 慢速分解）。
+
+### 4. 基于主观信心的模糊映射 (Subjective Confidence Mapping)
+* **创新点:** 在UI上摒弃精确数字录入，采用“体感四阶评估”来映射后台熟练度，利用用户的“主观信心”修正训练周期。
+
+---
+
+## 二、 后端核心逻辑：智能调度系统
+
+### 1. 核心参数 (The 4 Variables)
+系统为每个条目维护以下四个参数：
+* **$S$ (Stability - 稳定性):** 技能在大脑/肌肉中的稳固程度。
+* **$D$ (Difficulty - 固有难度):** 用户设定或根据指令长度/帧数判定。
+* **$P$ (Performance - 当次表现):** 通过“体感评估”映射出的数值区间。
+* **$T$ (Time - 间隔):** 距离上次训练的时间。
+
+### 2. 训练周期三阶段 (The Lifecycle)
+
+#### 阶段一：习得期 (Acquisition)
+* **特征:** 刚录入的新技能。
+* **逻辑:** 强制连续 3 天出现，只有连续 3 天评级为“Good/Easy”才晋级。
+* **UI:** 🔥 New/Hot 标记。
+
+#### 阶段二：巩固期 (Consolidation)
+* **特征:** 进入动态间隔算法。
+* **逻辑:** 根据 $P$ 值计算下一次复习倍率 $M$ ($I_{next} = I_{current} \times M$)。
+    * **Fail:** 重置 (M=0)
+    * **Hard:** 维持/减半 (M=0.5~1.0)
+    * **Good:** 小幅延长 (M=1.2~1.5)
+    * **Easy:** 大幅延长 (M=2.0~2.5)
+* **UI:** 🛡️ Stabilizing 标记。
+
+#### 阶段三：维护期 (Maintenance)
+* **特征:** 长期不练，极低频率检查。
+* **逻辑:** 长周期（15/30/60天） + **随机抽查机制 (Spot Check)**。
+* **UI:** 💎 Mastered 标记。
+
+### 3. 系统鲁棒性 (Self-Healing)
+* 容忍用户输入的“模糊数据”。
+* 若用户高估自己（实际菜但选了Easy），下次拉长周期后的训练必然失败，系统会自动捕获并降级。
+
+---
+
+## 三、 前端交互设计 (UI/UX)
+
+### 1. 录入层 (The Dojo)
+* **情境 (Situation):** 敌方角色 + 状态（版边/倒地/被防） + 资源。
+* **解法 (Solution):** 启动技 + 连招 + 伤害。
+* **标签系统:** 自动或手动打标 `#确反` `#对策` `#压起身`。
+
+### 2. 训练层 (The Gym)
+* **模拟测试模式:**
+    * 屏幕显示：“肯 龙尾脚 被防！” (隐去解法)。
+    * 用户在游戏内尝试操作。
+    * 操作后点击屏幕查看答案。
+* **四阶体感评估 (The 4-Button Assessment):**
+    * 🔴 **没按出来 (Fail):** 周期重置，立即重修。
+    * 🟠 **很吃力 (Hard):** 脑会手生，维持周期。
+    * 🟢 **还可以 (Good):** 正常掌握，按部就班。
+    * 🔵 **完美 (Easy):** 肌肉记忆，下次再见。
+
+### 3. 可视化反馈 (Dashboard)
+* **技能血条 (Skill Health Bar):** 随时间推移从绿变红，直观展示“遗忘/衰退”。
+* **今日清单 (Daily Deck):** 智能生成的每日任务包。
+
+---
+
+## 四、 关键数据结构定义 (JSON Schema Draft)
+
+```json
+{
+  "training_item": {
+    "id": "uuid-v4",
+    "meta": {
+      "target_character": "Ken",
+      "player_character": "Ryu",
+      "tags": ["punish", "corner", "frame_advantage"]
+    },
+    "situation": {
+      "description": "肯龙尾脚被防 (-4F)",
+      "visual_cue": "image_url_or_icon"
+    },
+    "solution": {
+      "command": "5LP > 2MP > 236HK",
+      "damage": 1800,
+      "difficulty_rating": 3
+    },
+    "state": {
+      "phase": "consolidation",
+      "stability": 2.5,
+      "last_reviewed_at": "2026-01-29",
+      "next_review_at": "2026-02-01",
+      "history": [
+        {"date": "2026-01-28", "rating": "hard"},
+        {"date": "2026-01-29", "rating": "good"}
+      ]
+    }
+  }
+}
+```
